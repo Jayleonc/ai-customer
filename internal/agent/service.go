@@ -718,6 +718,10 @@ func floatPtr(value float64) *float64 {
 	return &value
 }
 
+func intPtr(value int) *int {
+	return &value
+}
+
 // executeToolSafe 带超时和 panic 恢复的工具执行
 // 防止单个工具调用阻塞整个 Agent 循环或因 panic 导致进程崩溃
 func (s *Service) executeToolSafe(ctx context.Context, call ToolCall, groupID string) string {
@@ -826,15 +830,6 @@ func (s *Service) checkReplyQuality(reply string) string {
 type chatMessage struct {
 	Role    string `json:"role"`
 	Content string `json:"content,omitempty"`
-}
-
-type llmResponse struct {
-	Choices []struct {
-		Message struct {
-			Role    string `json:"role"`
-			Content string `json:"content"`
-		} `json:"message"`
-	} `json:"choices"`
 }
 
 // BuildSystemPrompt 构建群聊客服的 system prompt

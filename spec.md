@@ -2,11 +2,18 @@
 
 > 版本: v0.1 | 日期: 2026-03-26
 
+> 2026-04-14 同步说明：
+> 本文档包含一部分早期方案描述。
+> 当前代码实现已经接入 `turnmesh`：
+> - 多轮主链路走 `turnmesh.New(...).RunTurn(...)`
+> - query rewrite 走 `turnmesh.RunOneShot(...)`
+> 因此阅读本文时，应把“业务壳在 ai-customer，runtime 在 turnmesh”作为当前事实。
+
 ## 1. 项目定位
 
 ai-customer 是一个**独立的企微群 AI 客服服务**。它接收企微群聊回调消息，经过触发规则过滤后，调用 knowledge-hub (kh) 的知识检索 API 获取答案，再通过企微 API 回复到群内。
 
-ai-customer 不是 kh 的附庸。kh 对 ai-customer 而言是"知识数据源"，地位等同于数据库或缓存——是依赖，不是主人。ai-customer 拥有自己的 Agent、会话管理、prompt 策略和业务逻辑。
+ai-customer 不是 kh 的附庸。kh 对 ai-customer 而言是"知识数据源"，地位等同于数据库或缓存——是依赖，不是主人。ai-customer 拥有自己的业务 Agent 壳、会话管理、prompt 策略和业务逻辑；底层 runtime 由 `turnmesh` 提供。
 
 ```
 ┌──────────────────────────────────────────────────────┐
@@ -109,7 +116,12 @@ message (消息表)
 
 ### 2.4 Agent 引擎
 
-基于 langchaingo OpenAI Functions Agent 模式，独立于 kh 的 Agent 实现。
+当前实现不是 langchaingo Agent。
+
+当前边界是：
+
+- `ai-customer` 保留 prompt、preSearch、query rewrite、工具定义和业务 fallback
+- `turnmesh` 提供 provider session、one-shot 调用、多轮 turn loop 和 tool dispatch
 
 **工具集：**
 

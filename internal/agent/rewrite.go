@@ -1,19 +1,16 @@
 package agent
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
-	"io"
 	"log/slog"
-	"net/http"
 	"regexp"
 	"strings"
 	"time"
 	"unicode/utf8"
 
 	"git.pinquest.cn/ai-customer/internal/model"
+	"github.com/Jayleonc/turnmesh"
 )
 
 const rewriteSystemPrompt = `你是一个查询重写助手。你的任务是根据群聊的对话历史，判断用户最新的一句话到底在问什么，然后输出一个适合知识库检索的 query。
@@ -33,10 +30,8 @@ func (s *Service) rewriteQueryWithLLM(ctx context.Context, query string, history
 	// 独立超时：rewrite 不值得等太久，超时直接用原始 query
 	rewriteCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
 	defer cancel()
-	// 构建 messages：system + 完整历史 + 当前 rewrite 请求
-	messages := []chatMessage{
-		{Role: "system", Content: rewriteSystemPrompt},
-	}
+	// 构建 messages：完整历史 + 当前 rewrite 请求
+	var messages []chatMessage
 
 	// 注入完整的对话历史，让 AI 理解完整上下文
 	for _, msg := range history {
@@ -60,54 +55,27 @@ func (s *Service) rewriteQueryWithLLM(ctx context.Context, query string, history
 		rewriteModel = s.cfg.Model
 	}
 
-	reqBody := rewriteLLMRequest{
-		Model:       rewriteModel,
-		Messages:    messages,
-		Temperature: 0.1,
-		MaxTokens:   100,
-	}
-
-	body, err := json.Marshal(reqBody)
+	result, err := turnmesh.RunOneShot(rewriteCtx, turnmesh.Config{
+		Provider:        "openai-chatcompat",
+		Model:           rewriteModel,
+		BaseURL:         s.cfg.BaseURL,
+		APIKey:          s.cfg.APIKey,
+		Temperature:     floatPtr(0.1),
+		MaxOutputTokens: intPtr(100),
+		HTTPClient:      s.httpClient,
+	}, turnmesh.OneShotRequest{
+		SystemPrompt: rewriteSystemPrompt,
+		Messages:     runtimeMessages(messages),
+		Metadata: map[string]string{
+			"purpose": "query_rewrite",
+		},
+	})
 	if err != nil {
-		slog.Warn("[agent] rewrite marshal failed, using original query", "error", err)
+		slog.Warn("[agent] rewrite one-shot failed, using original query", "error", err)
 		return fallbackRewriteQuery(query)
 	}
 
-	url := strings.TrimRight(s.cfg.BaseURL, "/") + "/chat/completions"
-	req, err := http.NewRequestWithContext(rewriteCtx, http.MethodPost, url, bytes.NewReader(body))
-	if err != nil {
-		slog.Warn("[agent] rewrite request failed, using original query", "error", err)
-		return fallbackRewriteQuery(query)
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+s.cfg.APIKey)
-
-	resp, err := s.httpClient.Do(req)
-	if err != nil {
-		slog.Warn("[agent] rewrite LLM call failed, using original query", "error", err)
-		return fallbackRewriteQuery(query)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(resp.Body)
-		slog.Warn("[agent] rewrite LLM returned error, using original query",
-			"status", resp.StatusCode, "body", string(respBody))
-		return fallbackRewriteQuery(query)
-	}
-
-	var out llmResponse
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		slog.Warn("[agent] rewrite response decode failed, using original query", "error", err)
-		return fallbackRewriteQuery(query)
-	}
-
-	if len(out.Choices) == 0 {
-		slog.Warn("[agent] rewrite LLM returned empty choices, using original query")
-		return fallbackRewriteQuery(query)
-	}
-
-	rewritten := strings.TrimSpace(out.Choices[0].Message.Content)
+	rewritten := strings.TrimSpace(result.Text)
 	if rewritten == "" {
 		return fallbackRewriteQuery(query)
 	}
@@ -158,12 +126,4 @@ func fallbackRewriteQuery(query string) string {
 		return trimmed
 	}
 	return best
-}
-
-// rewriteLLMRequest rewrite 专用的请求体（不需要 tools，限制 max_tokens）
-type rewriteLLMRequest struct {
-	Model       string        `json:"model"`
-	Messages    []chatMessage `json:"messages"`
-	Temperature float64       `json:"temperature"`
-	MaxTokens   int           `json:"max_tokens,omitempty"`
 }
