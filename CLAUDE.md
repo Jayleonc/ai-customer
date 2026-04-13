@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-**ai-customer** is a Go service that acts as a WeChat Work (企业微信) group chatbot backed by AI. It receives webhook callbacks from WeChat Work, processes @robot mentions in group chats, and uses OpenAI function calling to answer questions by searching a knowledge-hub service.
+**ai-customer** is a Go service that acts as a WeChat Work (企业微信) group chatbot backed by AI. It receives webhook callbacks from WeChat Work, processes @robot mentions in group chats, and uses `turnmesh` as the runtime loop to answer questions by searching a knowledge-hub service.
 
 ## Build & Run
 
@@ -30,7 +30,7 @@ go build -o ai-customer ./cmd/server/
 WeChat Work Callback → callback.Handler (verify signature + decrypt)
   → dispatcher.Dispatcher (route by event type)
     → message.Handler (filter @robot mentions, manage conversations)
-      → agent.Service (OpenAI function calling loop)
+      → agent.Service (business shell + turnmesh runtime)
         → Tools: search_knowledge, read_document, check_feature_tag, ask_clarification
           → khclient (knowledge-hub REST API)
       → wecom.Client (send reply back to group)
@@ -38,14 +38,14 @@ WeChat Work Callback → callback.Handler (verify signature + decrypt)
 
 **Key design decisions:**
 - Conversations are group-scoped — each WeChat group maintains its own conversation context
-- The agent uses iterative function calling (up to `max_iterations`) with 4 tools
+- The business shell stays in `ai-customer`, while turn/tool loop is delegated to `turnmesh`
 - Groups map to customers with feature tags (不同客户开通的功能不同), controlling which features are available
 - When questions are vague, the agent asks clarifying questions instead of guessing
 
 ## Module Layout
 
 - `cmd/server/` — Entry point + Google Wire DI setup
-- `internal/agent/` — AI agent engine: OpenAI function calling loop (`service.go`) and tool definitions (`tools.go`)
+- `internal/agent/` — AI agent business shell: prompt assembly, pre-search, query rewrite, tool definitions, and turnmesh adapter
 - `internal/callback/` — WeChat Work webhook handler with crypto verification
 - `internal/dispatcher/` — Event routing by type
 - `internal/message/` — Group message processing (filters @robot mentions)
@@ -61,7 +61,7 @@ WeChat Work Callback → callback.Handler (verify signature + decrypt)
 - **Go 1.24.1**, Gin (HTTP), GORM (ORM), PostgreSQL
 - **Google Wire** for compile-time dependency injection
 - **Viper** for YAML config with env var support
-- **OpenAI API** for function calling agent
+- **OpenAI-compatible API** as model backend, wrapped by `turnmesh`
 
 ## Conventions
 

@@ -3,7 +3,7 @@ module git.pinquest.cn/ai-customer
 go 1.25.2
 
 require (
-	github.com/Jayleonc/turnmesh v0.0.0
+	github.com/Jayleonc/turnmesh v0.1.0
 	github.com/gin-contrib/cors v1.7.5
 	github.com/gin-gonic/gin v1.10.1
 	github.com/google/uuid v1.6.0
@@ -56,5 +56,3 @@ require (
 	google.golang.org/protobuf v1.36.6 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
-
-replace github.com/Jayleonc/turnmesh => /Users/jayleonc/Developer/ts/turnmesh

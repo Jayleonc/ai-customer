@@ -21,10 +21,6 @@ func estimateMessagesTokens(messages []chatMessage) int {
 	for _, m := range messages {
 		total += estimateTokens(m.Content)
 		total += 4 // 每条消息的 role/分隔符开销
-		for _, tc := range m.ToolCalls {
-			total += estimateTokens(tc.Function.Arguments)
-			total += estimateTokens(tc.Function.Name) + 8
-		}
 	}
 	total += 3 // reply priming
 	return total

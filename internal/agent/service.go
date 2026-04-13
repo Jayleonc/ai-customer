@@ -1,11 +1,9 @@
 package agent
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log/slog"
 	"net/http"
 	"sort"
@@ -656,22 +654,6 @@ func (s *Service) buildMessages(ctx context.Context, req *Request) []chatMessage
 	return messages
 }
 
-func (s *Service) buildToolDefs() []toolDef {
-	defined := DefinedTools()
-	defs := make([]toolDef, len(defined))
-	for i, t := range defined {
-		defs[i] = toolDef{
-			Type: "function",
-			Function: toolFunction{
-				Name:        t.Name,
-				Description: t.Description,
-				Parameters:  t.Parameters,
-			},
-		}
-	}
-	return defs
-}
-
 func (s *Service) buildRuntimeTools(groupID string) []turnmesh.Tool {
 	defined := DefinedTools()
 	tools := make([]turnmesh.Tool, 0, len(defined))
@@ -734,36 +716,6 @@ func firstNonEmptyRaw(values ...json.RawMessage) json.RawMessage {
 
 func floatPtr(value float64) *float64 {
 	return &value
-}
-
-// ---- 控制循环基础设施 ----
-
-// callLLMWithRetry 带重试的 LLM 调用，失败后指数退避重试
-func (s *Service) callLLMWithRetry(ctx context.Context, messages []chatMessage, tools []toolDef) (*llmResponse, error) {
-	var lastErr error
-	maxAttempts := s.cfg.LLMRetryCount + 1
-	if maxAttempts < 1 {
-		maxAttempts = 1
-	}
-
-	for attempt := 0; attempt < maxAttempts; attempt++ {
-		if attempt > 0 {
-			backoff := time.Duration(attempt) * 500 * time.Millisecond
-			slog.Warn("[agent] LLM retry", "attempt", attempt, "backoff", backoff, "last_error", lastErr)
-			select {
-			case <-time.After(backoff):
-			case <-ctx.Done():
-				return nil, ctx.Err()
-			}
-		}
-
-		resp, err := s.callLLM(ctx, messages, tools)
-		if err == nil {
-			return resp, nil
-		}
-		lastErr = err
-	}
-	return nil, lastErr
 }
 
 // executeToolSafe 带超时和 panic 恢复的工具执行
@@ -871,92 +823,18 @@ func (s *Service) checkReplyQuality(reply string) string {
 	return string(runes[:cutoff])
 }
 
-// ---- OpenAI API types ----
-
 type chatMessage struct {
-	Role       string        `json:"role"`
-	Content    string        `json:"content,omitempty"`
-	ToolCalls  []apiToolCall `json:"tool_calls,omitempty"`
-	ToolCallID string        `json:"tool_call_id,omitempty"`
-}
-
-type toolDef struct {
-	Type     string       `json:"type"`
-	Function toolFunction `json:"function"`
-}
-
-type toolFunction struct {
-	Name        string         `json:"name"`
-	Description string         `json:"description"`
-	Parameters  map[string]any `json:"parameters"`
-}
-
-type apiToolCall struct {
-	ID       string `json:"id"`
-	Type     string `json:"type"`
-	Function struct {
-		Name      string `json:"name"`
-		Arguments string `json:"arguments"`
-	} `json:"function"`
-}
-
-type llmRequest struct {
-	Model       string        `json:"model"`
-	Messages    []chatMessage `json:"messages"`
-	Tools       []toolDef     `json:"tools,omitempty"`
-	Temperature float64       `json:"temperature"`
+	Role    string `json:"role"`
+	Content string `json:"content,omitempty"`
 }
 
 type llmResponse struct {
 	Choices []struct {
 		Message struct {
-			Role      string        `json:"role"`
-			Content   string        `json:"content"`
-			ToolCalls []apiToolCall `json:"tool_calls"`
+			Role    string `json:"role"`
+			Content string `json:"content"`
 		} `json:"message"`
 	} `json:"choices"`
-}
-
-func (s *Service) callLLM(ctx context.Context, messages []chatMessage, tools []toolDef) (*llmResponse, error) {
-	reqBody := llmRequest{
-		Model:       s.cfg.Model,
-		Messages:    messages,
-		Tools:       tools,
-		Temperature: s.cfg.Temperature,
-	}
-
-	body, err := json.Marshal(reqBody)
-	if err != nil {
-		return nil, err
-	}
-
-	url := strings.TrimRight(s.cfg.BaseURL, "/") + "/chat/completions"
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+s.cfg.APIKey)
-
-	resp, err := s.httpClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		respBody, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("LLM API returned %d: %s", resp.StatusCode, string(respBody))
-	}
-
-	var out llmResponse
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return nil, err
-	}
-	if len(out.Choices) == 0 {
-		return nil, fmt.Errorf("LLM returned empty choices")
-	}
-	return &out, nil
 }
 
 // BuildSystemPrompt 构建群聊客服的 system prompt

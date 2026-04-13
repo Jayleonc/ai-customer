@@ -56,7 +56,6 @@ type AgentConfig struct {
 	APIKey         string  `mapstructure:"api_key"`
 	Model          string  `mapstructure:"model"`
 	Temperature    float64 `mapstructure:"temperature"`
-	MaxIterations  int     `mapstructure:"max_iterations"`
 	HistoryLimit   int     `mapstructure:"history_limit"`
 	ReplyMaxLength int     `mapstructure:"reply_max_length"`
 
@@ -71,10 +70,9 @@ type AgentConfig struct {
 	QueryRewriteMode  string `mapstructure:"query_rewrite_mode"`  // 重写模式：llm（默认）/ disabled（关闭）
 	QueryRewriteModel string `mapstructure:"query_rewrite_model"` // LLM 重写使用的模型（空则复用主模型）
 
-	// 控制循环配置
-	TokenBudget        int `mapstructure:"token_budget"`          // 单次 LLM 调用最大输入 token 数（默认 6000）
-	ToolTimeoutSeconds int `mapstructure:"tool_timeout_seconds"`  // 工具调用超时秒数（默认 30）
-	LLMRetryCount      int `mapstructure:"llm_retry_count"`       // LLM 调用失败重试次数（默认 1）
+	// Runtime 配置
+	TokenBudget        int `mapstructure:"token_budget"`         // 单次 LLM 调用最大输入 token 数（默认 6000）
+	ToolTimeoutSeconds int `mapstructure:"tool_timeout_seconds"` // 工具调用超时秒数（默认 30）
 }
 
 func LoadConfig(configPath ...string) (*Config, error) {
@@ -123,9 +121,6 @@ func LoadConfig(configPath ...string) (*Config, error) {
 	if cfg.Agent.Temperature == 0 {
 		cfg.Agent.Temperature = 0.3
 	}
-	if cfg.Agent.MaxIterations <= 0 {
-		cfg.Agent.MaxIterations = 5
-	}
 	if cfg.Agent.HistoryLimit <= 0 {
 		cfg.Agent.HistoryLimit = 20
 	}
@@ -137,9 +132,6 @@ func LoadConfig(configPath ...string) (*Config, error) {
 	}
 	if cfg.Agent.ToolTimeoutSeconds <= 0 {
 		cfg.Agent.ToolTimeoutSeconds = 30
-	}
-	if cfg.Agent.LLMRetryCount <= 0 {
-		cfg.Agent.LLMRetryCount = 1
 	}
 
 	fmt.Printf("Configuration loaded from %s\n", v.ConfigFileUsed())

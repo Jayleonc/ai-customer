@@ -570,9 +570,8 @@ redis:
 
 # Agent 配置
 agent:
-  model_id: "gpt-4o-mini"
+  model: "gpt-4o-mini"
   temperature: 0.3
-  max_iterations: 5
   history_limit: 20          # 注入 Agent 的历史消息条数
   reply_max_length: 500      # 回复最大字符数
 ```
