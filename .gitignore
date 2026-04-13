@@ -1,0 +1,19 @@
+# Go binaries and build artifacts
+bin/
+*.exe
+*.test
+*.out
+
+# IDE and OS files
+.idea/
+.vscode/
+.DS_Store
+
+uploads
+node_modules/
+dist/
+
+docs
+source-doc/
+
+configs/config.yaml

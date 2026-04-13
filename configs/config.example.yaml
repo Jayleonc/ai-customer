@@ -1,0 +1,51 @@
+server:
+  port: "8080"
+  mode: "debug"
+
+log:
+  level: "info"
+  format: "json"
+
+database:
+  dsn: "host=127.0.0.1 user=root password=jayleonc dbname=ai_customer port=15432 sslmode=disable"
+
+# 企微平台配置
+wecom:
+  api_host: "https://s2.xunjinet.com.cn"
+  app_key: "${WECOM_APP_KEY}"
+  app_secret: "${WECOM_APP_SECRET}"
+  callback:
+    token: "${WECOM_CALLBACK_TOKEN}"
+    aes_key: "${WECOM_CALLBACK_AES_KEY}"
+
+# knowledge-hub 配置
+knowledge_hub:
+  host: "http://localhost:9090"
+  api_key: "${KH_API_KEY}"
+  timeout: 30  # seconds
+
+# AI Agent 配置
+agent:
+  base_url: "https://api.openai.com/v1"
+  api_key: "${OPENAI_API_KEY}"
+  model: "gpt-4o-mini"
+  temperature: 0.3
+  max_iterations: 5
+  history_limit: 20
+  reply_max_length: 800
+
+  # 预检索配置（preSearch 在 LLM 调用前自动检索知识库）
+  pre_search_strategy: "hybrid"        # 预检索策略：semantic / keyword / hybrid
+  pre_search_top_k: 10                 # 预检索返回数量（注入 context 前会再截取 top N）
+  pre_search_score_threshold: 0.3      # 预检索分数阈值
+  pre_search_max_snippets: 5           # 注入 context 的最大片段数
+  pre_search_max_snippet_length: 300   # 每个片段最大字数
+
+  # Query Rewrite 配置（调用小模型重写模糊问题，提升检索召回率）
+  query_rewrite_mode: "llm"            # 重写模式：llm（小模型重写）/ rule（规则拼接）/ disabled（关闭）
+  query_rewrite_model: ""              # LLM 重写使用的模型（空则复用主模型，推荐用便宜的如 deepseek-chat）
+
+  # 控制循环配置（Agent 韧性保障）
+  token_budget: 6000                   # 单次 LLM 调用最大输入 token 数，超限自动裁剪历史
+  tool_timeout_seconds: 30             # 工具调用超时秒数，超时返回错误消息继续循环
+  llm_retry_count: 1                   # LLM 调用失败重试次数（0=不重试，1=重试一次）
