@@ -17,3 +17,9 @@ docs
 source-doc/
 
 configs/config.yaml
+
+# Local-only internal docs
+CLAUDE.md
+DEV_LOG.md
+spec.md
+think.md
