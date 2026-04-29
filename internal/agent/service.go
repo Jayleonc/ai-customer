@@ -93,7 +93,7 @@ func (s *Service) Execute(ctx context.Context, req *Request) (string, error) {
 	})
 	if err != nil {
 		if preSearchResult != "" {
-			slog.Warn("[agent] turnmesh init failed, degrading to pre-search", "error", err)
+			slog.Warn("[agent] turnmesh init failed, degrading to pre-search", turnmeshErrorLogAttrs(err)...)
 			return s.degradeToPreSearch(preSearchResult), nil
 		}
 		return "", fmt.Errorf("turnmesh init failed: %w", err)
@@ -111,7 +111,7 @@ func (s *Service) Execute(ctx context.Context, req *Request) (string, error) {
 	})
 	if err != nil {
 		if preSearchResult != "" {
-			slog.Warn("[agent] turnmesh run failed, degrading to pre-search", "error", err)
+			slog.Warn("[agent] turnmesh run failed, degrading to pre-search", turnmeshErrorLogAttrs(err)...)
 			return s.degradeToPreSearch(preSearchResult), nil
 		}
 		return "", fmt.Errorf("turnmesh run failed: %w", err)
@@ -720,6 +720,24 @@ func floatPtr(value float64) *float64 {
 
 func intPtr(value int) *int {
 	return &value
+}
+
+func turnmeshErrorLogAttrs(err error) []any {
+	attrs := []any{"error", err}
+	tmErr, ok := turnmesh.AsError(err)
+	if !ok {
+		return attrs
+	}
+	if tmErr.Code != "" {
+		attrs = append(attrs, "turnmesh_code", tmErr.Code)
+	}
+	if tmErr.Cause != "" {
+		attrs = append(attrs, "turnmesh_cause", tmErr.Cause)
+	}
+	if len(tmErr.Details) > 0 {
+		attrs = append(attrs, "turnmesh_details", tmErr.Details)
+	}
+	return attrs
 }
 
 // executeToolSafe 带超时和 panic 恢复的工具执行

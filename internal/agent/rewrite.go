@@ -71,7 +71,7 @@ func (s *Service) rewriteQueryWithLLM(ctx context.Context, query string, history
 		},
 	})
 	if err != nil {
-		slog.Warn("[agent] rewrite one-shot failed, using original query", "error", err)
+		slog.Warn("[agent] rewrite one-shot failed, using original query", turnmeshErrorLogAttrs(err)...)
 		return fallbackRewriteQuery(query)
 	}
 

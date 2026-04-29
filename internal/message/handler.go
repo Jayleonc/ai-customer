@@ -95,11 +95,31 @@ func (h *Handler) HandleGroupMessage(ctx context.Context, evt *model.ReceiveGrou
 	// 2. 顺手更新群成员表：发送者 + at_list 里的人
 	h.ensureGroupMembers(ctx, groupID, msg)
 
-	// 3. 检查群是否已注册
+	// 3. 检查群是否已注册，没有则自动创建并触发同步信息
 	group, err := h.groupStore.GetByGroupID(ctx, groupID)
 	if err != nil {
-		slog.Warn("[msg] group not registered, ignoring", "group_id", groupID, "error", err)
-		return
+		slog.Warn("[msg] group not registered, auto-creating...", "group_id", groupID, "error", err)
+		if err := h.groupStore.UpsertFromCallback(ctx, groupID, "", robotID, ""); err != nil {
+			slog.Error("[msg] auto-create group failed", "error", err)
+			return
+		}
+
+		// 异步触发群信息和成员列表拉取，以便在接下来完善群对象属性（被动接收事件中触发同样逻辑）
+		go func(bgCtx context.Context, rID, gID string) {
+			if e := h.wecom.GetRemoteGroup(bgCtx, rID, gID, uuid.NewString()); e != nil {
+				slog.Warn("[msg] GetRemoteGroup failed", "group_id", gID, "error", e)
+			}
+			if e := h.wecom.GetGroupMemberList(bgCtx, rID, gID, uuid.NewString()); e != nil {
+				slog.Warn("[msg] GetGroupMemberList failed", "group_id", gID, "error", e)
+			}
+		}(context.Background(), robotID, groupID)
+
+		// 再次获取群对象
+		group, err = h.groupStore.GetByGroupID(ctx, groupID)
+		if err != nil {
+			slog.Error("[msg] reload group failed", "error", err)
+			return
+		}
 	}
 
 	// 3.5 守卫：当前机器人不在本群的允许响应列表中，直接跳过
