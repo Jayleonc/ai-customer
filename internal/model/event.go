@@ -16,28 +16,29 @@ type CallbackPayload struct {
 // ---- 事件类型常量 (以 source-doc/002-事件码.md 为准) ----
 const (
 	// 机器人
-	EventLoginSuccess          = "login.success"
-	EventLogout                = "logout"
-	EventRobotInitialized      = "robot.initialized.success"
+	EventLoginSuccess     = "login.success"
+	EventLogout           = "logout"
+	EventRobotInitialized = "robot.initialized.success"
 
 	// 群生命周期
-	EventCreateContactGroup    = "create.contact.group"
-	EventDismissGroup          = "dismiss.group"
-	EventGroupUpdateName       = "group.update.name"
-	EventGroupOwnerChange      = "group.owner.change"
-	EventRobotJoinGroup        = "robot.join.group"
-	EventWatchGroup            = "watch.group"
-	EventQuitGroup             = "quit.group"
+	EventCreateContactGroup = "create.contact.group"
+	EventDismissGroup       = "dismiss.group"
+	EventGroupUpdateName    = "group.update.name"
+	EventGroupOwnerChange   = "group.owner.change"
+	EventRobotJoinGroup     = "robot.join.group"
+	EventWatchGroup         = "watch.group"
+	EventQuitGroup          = "quit.group"
 
 	// 群成员
-	EventMemberJoinGroup       = "member.join.group"
-	EventMemberQuitGroup       = "member.quit.group"   // 废弃，但仍可能收到
-	EventRemoveGroupMember     = "remove.group.member"
+	EventMemberJoinGroup   = "member.join.group"
+	EventMemberQuitGroup   = "member.quit.group" // 废弃，但仍可能收到
+	EventRemoveGroupMember = "remove.group.member"
 
 	// 消息
-	EventReceiveGroupMsg       = "receive.group.msg"
-	EventReceiveContactMsg     = "receive.contact.msg"
-	EventSendGroupMsg          = "send.group.msg"
+	EventReceiveGroupMsg   = "receive.group.msg"
+	EventReceiveContactMsg = "receive.contact.msg"
+	EventSendGroupMsg      = "send.group.msg"
+	EventDownloadChatFile  = "download.chat.file"
 
 	// 主动拉取回调
 	EventGetGroup           = "get.group"             // GetRemoteGroup 异步结果
@@ -312,16 +313,17 @@ type ReceiveGroupMsgData struct {
 }
 
 type GroupMessage struct {
-	SenderID   string     `json:"sender_id"`
-	SenderType int        `json:"sender_type"` // 1=企微联系人, 2=微信好友, 3=内部成员
-	ReceiverID string     `json:"receiver_id"` // 群 ID
-	MsgID      string     `json:"msg_id"`
-	MsgType    int        `json:"msg_type"`
-	AppInfo    string     `json:"app_info"`
-	MsgContent MsgContent `json:"msg_content"`
-	IsAtAll    bool       `json:"is_at_all"`
-	AtList     []AtMember `json:"at_list"`
-	AtLocation int        `json:"at_location"` // 0=开头, 1=结尾
+	SenderID     string     `json:"sender_id"`
+	SenderType   int        `json:"sender_type"` // 1=企微联系人, 2=微信好友, 3=内部成员
+	ReceiverID   string     `json:"receiver_id"` // 群 ID
+	MsgID        string     `json:"msg_id"`
+	MsgType      int        `json:"msg_type"`
+	AppInfo      string     `json:"app_info"`
+	QuoteAppInfo string     `json:"quote_app_info"`
+	MsgContent   MsgContent `json:"msg_content"`
+	IsAtAll      bool       `json:"is_at_all"`
+	AtList       []AtMember `json:"at_list"`
+	AtLocation   int        `json:"at_location"` // 0=开头, 1=结尾
 }
 
 type AtMember struct {
@@ -368,6 +370,25 @@ type SendGroupMsgAsyncEvent struct {
 	BaseEvent
 }
 
+// ---- 下载聊天文件异步结果 (download.chat.file) ----
+
+type DownloadChatFileEvent struct {
+	BaseEvent
+	Data DownloadChatFileData `json:"-"`
+}
+
+type DownloadChatFileData struct {
+	FileURL  string `json:"file_url"`
+	FileName string `json:"file_name"`
+}
+
+func (e *DownloadChatFileEvent) UnmarshalJSON(b []byte) error {
+	if err := json.Unmarshal(b, &e.BaseEvent); err != nil {
+		return err
+	}
+	return json.Unmarshal(e.RawData, &e.Data)
+}
+
 // ---- 私聊消息事件 (receive.contact.msg) ----
 
 type ReceiveContactMsgEvent struct {
@@ -408,9 +429,9 @@ type GetGroupMemberListEvent struct {
 }
 
 type GetGroupMemberListData struct {
-	GroupID    string               `json:"group_id"`
-	MemberList []RemoteGroupMember  `json:"member_list"`
-	HasMore    bool                 `json:"has_more"`
+	GroupID    string              `json:"group_id"`
+	MemberList []RemoteGroupMember `json:"member_list"`
+	HasMore    bool                `json:"has_more"`
 }
 
 type RemoteGroupMember struct {

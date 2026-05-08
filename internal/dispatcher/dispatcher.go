@@ -114,6 +114,25 @@ func (d *Dispatcher) Dispatch(ctx context.Context, eventType string, raw []byte)
 		}
 		return nil
 
+	case model.EventDownloadChatFile:
+		var evt model.DownloadChatFileEvent
+		if err := json.Unmarshal(raw, &evt); err != nil {
+			return fmt.Errorf("unmarshal download.chat.file: %w", err)
+		}
+		resolved := d.wecom.CompleteDownloadChatFile(evt.UniqSN, wecom.DownloadChatFileResult{
+			FileURL:  evt.Data.FileURL,
+			FileName: evt.Data.FileName,
+			ErrCode:  evt.ErrCode,
+			ErrMsg:   evt.ErrMsg,
+		})
+		if !resolved {
+			slog.Warn("download chat file callback has no waiter",
+				"uniq_sn", evt.UniqSN,
+				"err_code", evt.ErrCode,
+				"err_msg", evt.ErrMsg)
+		}
+		return nil
+
 	// ============ 主动拉取回调 ============
 
 	case model.EventGetGroup:

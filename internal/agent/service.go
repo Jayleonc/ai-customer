@@ -22,18 +22,14 @@ import (
 type Service struct {
 	cfg          config.AgentConfig
 	toolExecutor *ToolExecutor
-	khClient     *khclient.Client
-	groupStore   *store.GroupStore
 	msgStore     *store.MessageStore
 	httpClient   *http.Client
 }
 
-func NewService(cfg config.AgentConfig, executor *ToolExecutor, kh *khclient.Client, gs *store.GroupStore, msgStore *store.MessageStore) *Service {
+func NewService(cfg config.AgentConfig, executor *ToolExecutor, msgStore *store.MessageStore) *Service {
 	return &Service{
 		cfg:          cfg,
 		toolExecutor: executor,
-		khClient:     kh,
-		groupStore:   gs,
 		msgStore:     msgStore,
 		httpClient:   &http.Client{Timeout: 120 * time.Second},
 	}
@@ -41,40 +37,17 @@ func NewService(cfg config.AgentConfig, executor *ToolExecutor, kh *khclient.Cli
 
 // Request 是 Agent 执行请求
 type Request struct {
-	GroupID          string
-	ConversationID   string
-	SenderID         string
-	SenderName       string
-	UserQuery        string
-	SkipQueryRewrite bool
-	SystemPrompt     string
+	GroupID        string
+	ConversationID string
+	SenderID       string
+	SenderName     string
+	UserQuery      string
+	SystemPrompt   string
 }
 
 // Execute 执行 Agent 循环，返回最终回复文本
 func (s *Service) Execute(ctx context.Context, req *Request) (string, error) {
 	messages := s.buildMessages(ctx, req)
-
-	// TODO 不见得这是最好的，因为如果之前的聊天里已经回答过这个问题，又来问，那先RAG，绝对是浪费资源。所以不见得这个预检索是很好的，去掉似乎也可以。
-	// 强制预检索：在 LLM 决策之前，先用用户问题搜索知识库，把结果注入上下文
-	// 保存结果用于 LLM 不可用时的降级回复
-	var preSearchResult string
-	if req.UserQuery != "" {
-		preSearchResult = s.preSearch(ctx, req.UserQuery, req.GroupID, req.ConversationID, req.SkipQueryRewrite)
-		if preSearchResult != "" {
-			slog.Info("[agent] pre-search injected", "result_length", len(preSearchResult))
-			messages = append(messages, chatMessage{
-				Role:    "system",
-				Content: fmt.Sprintf("以下是知识库中与用户问题相关的检索结果，请基于这些内容回答：\n\n%s", preSearchResult),
-			})
-		} else {
-			// 预检索无结果：提示 LLM 不要反复调用 search_knowledge 浪费 token
-			// 引导其明确告知未检索到并追问关键上下文，而不是返回哨兵文本
-			messages = append(messages, chatMessage{
-				Role:    "system",
-				Content: "系统已自动检索知识库，暂未找到与用户问题直接相关的内容。你最多可以再尝试一次 search_knowledge（换用不同关键词），如果仍无结果，请直接告诉用户“当前知识库未检索到明确答案”，并追问一个关键补充信息。若存在多个可能场景，请用一句话给出 2-3 个候选让用户二选一/三选一（例如：你说的是 A 还是 B）。不要输出 [NO_ANSWER]。",
-			})
-		}
-	}
 
 	// Token 预算：裁剪历史消息，防止输入超模型上下文限制
 	messages = trimMessagesToBudget(messages, s.cfg.TokenBudget)
@@ -92,10 +65,6 @@ func (s *Service) Execute(ctx context.Context, req *Request) (string, error) {
 		HTTPClient:  s.httpClient,
 	})
 	if err != nil {
-		if preSearchResult != "" {
-			slog.Warn("[agent] turnmesh init failed, degrading to pre-search", turnmeshErrorLogAttrs(err)...)
-			return s.degradeToPreSearch(preSearchResult), nil
-		}
 		return "", fmt.Errorf("turnmesh init failed: %w", err)
 	}
 	defer runtime.Close()
@@ -110,10 +79,6 @@ func (s *Service) Execute(ctx context.Context, req *Request) (string, error) {
 		},
 	})
 	if err != nil {
-		if preSearchResult != "" {
-			slog.Warn("[agent] turnmesh run failed, degrading to pre-search", turnmeshErrorLogAttrs(err)...)
-			return s.degradeToPreSearch(preSearchResult), nil
-		}
 		return "", fmt.Errorf("turnmesh run failed: %w", err)
 	}
 
@@ -123,289 +88,170 @@ func (s *Service) Execute(ctx context.Context, req *Request) (string, error) {
 
 	answer := strings.TrimSpace(result.Text)
 	if answer == "" {
-		if preSearchResult != "" {
-			return s.degradeToPreSearch(preSearchResult), nil
-		}
 		return "抱歉，我处理这个问题花了太长时间。请尝试更具体地描述您的问题。", nil
 	}
 
 	return s.checkReplyQuality(answer), nil
 }
 
-// preSearch 在 LLM 调用前，结合对话历史重写 query，使用 hybrid 检索知识库
-// 直接调用 khClient 而非复用 searchKnowledge 工具，使用独立的预检索参数
-func (s *Service) preSearch(ctx context.Context, query string, groupID string, conversationID string, skipQueryRewrite bool) string {
-	// Step 1: Query Rewrite — 全量历史丢给 AI，让 AI 判断用户真正意图
-	rewrittenQuery := query
-	history, err := s.msgStore.ListRecent(ctx, conversationID, s.cfg.HistoryLimit)
-	if err != nil {
-		slog.Warn("[agent] pre-search load history failed", "error", err)
+func compactNonEmptyStrings(values []string) []string {
+	out := make([]string, 0, len(values))
+	seen := map[string]struct{}{}
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		if _, ok := seen[value]; ok {
+			continue
+		}
+		seen[value] = struct{}{}
+		out = append(out, value)
 	}
+	return out
+}
 
-	if !skipQueryRewrite && s.cfg.QueryRewriteMode != "disabled" {
-		rewrittenQuery = s.rewriteQueryWithLLM(ctx, query, history)
-		rewrittenQuery = enhanceQueryWithHistory(rewrittenQuery, history)
-	}
-	if rewrittenQuery != query {
-		slog.Info("[agent] query rewritten", "original", query, "rewritten", rewrittenQuery)
-	}
-
-	// Step 2: 获取群关联的 dataset_ids
-	var datasetIDs []string
-	if group, err := s.groupStore.GetByGroupID(ctx, groupID); err == nil && len(group.DatasetIDs) > 0 {
-		datasetIDs = group.DatasetIDs
-	}
-
-	// Step 3: hybrid 检索（kh 内部并行执行语义 + PGroonga 全文，RRF 融合）
-	strategy := s.cfg.PreSearchStrategy
-	if strategy == "" {
-		strategy = "hybrid"
-	}
-	topK := s.cfg.PreSearchTopK
-	if topK <= 0 {
-		topK = 10
-	}
-	keywords := enrichRetrieveKeywords(rewrittenQuery, extractRetrieveKeywords(rewrittenQuery))
-	if strategy == "hybrid" && topK < 200 {
-		topK = 200
-	}
-	scoreThreshold := s.cfg.PreSearchScoreThreshold
-	if scoreThreshold <= 0 {
-		scoreThreshold = 0.3
-	}
-
-	resp, err := s.khClient.Retrieve(ctx, &khclient.RetrieveRequest{
-		Query:          rewrittenQuery,
-		DatasetIDs:     datasetIDs,
-		Keywords:       keywords,
-		TopK:           topK,
-		ScoreThreshold: scoreThreshold,
-		SearchStrategy: strategy,
-	})
-	if err != nil {
-		slog.Warn("[agent] pre-search retrieve failed", "error", err)
-		return ""
-	}
-	if len(resp.List) == 0 {
-		slog.Info("[agent] pre-search no results", "query", rewrittenQuery)
-		return ""
-	}
-
-	// Step 3.5: 通用消歧增强
-	// 从首轮结果中提取候选术语（如功能名/模块名），用于：
-	// 1) 二次扩检索提升召回；
-	// 2) 注入给 LLM 作为反问候选，避免泛泛追问。
-	candidates := deriveDisambiguationCandidates(resp.List, rewrittenQuery, keywords, 6)
-	snippetKeywords := keywords
-	if len(candidates) > 0 {
-		snippetKeywords = mergeKeywordList(keywords, candidates[:minInt(3, len(candidates))], 8)
-	}
-	if len(candidates) > 0 {
-		topScore := resp.List[0].Score
-		if topScore < 0.85 {
-			refinedKeywords := snippetKeywords
-			refinedQuery := strings.TrimSpace(rewrittenQuery + " " + strings.Join(refinedKeywords, " "))
-			if refinedQuery != "" && refinedQuery != rewrittenQuery {
-				refinedResp, refinedErr := s.khClient.Retrieve(ctx, &khclient.RetrieveRequest{
-					Query:          refinedQuery,
-					DatasetIDs:     datasetIDs,
-					Keywords:       refinedKeywords,
-					TopK:           topK,
-					ScoreThreshold: scoreThreshold,
-					SearchStrategy: strategy,
-				})
-				if refinedErr != nil {
-					slog.Warn("[agent] pre-search refined retrieve failed", "error", refinedErr)
-				} else if len(refinedResp.List) > 0 {
-					originCount := len(resp.List)
-					resp.List = mergeRetrieveResults(resp.List, refinedResp.List, topK)
-					slog.Info("[agent] pre-search refined retrieve merged",
-						"origin_count", originCount,
-						"merged_count", len(resp.List),
-						"candidate_count", len(candidates),
-						"refined_query", refinedQuery)
-				}
-			}
+func firstNonEmptyText(values ...string) string {
+	for _, value := range values {
+		if strings.TrimSpace(value) != "" {
+			return value
 		}
 	}
+	return ""
+}
 
-	// Step 4: 格式化结果，top 5 片段 + 截断 300 字
-	maxSnippets := s.cfg.PreSearchMaxSnippets
-	if maxSnippets <= 0 {
-		maxSnippets = 5
+func trimTextByRunes(text string, maxRunes int, suffix string) string {
+	if maxRunes <= 0 || utf8.RuneCountInString(text) <= maxRunes {
+		return text
 	}
-	maxSnippetLen := s.cfg.PreSearchMaxSnippetLength
-	if maxSnippetLen <= 0 {
-		maxSnippetLen = 300
+	suffixRunes := utf8.RuneCountInString(suffix)
+	if suffixRunes >= maxRunes {
+		return string([]rune(text)[:maxRunes])
+	}
+	return string([]rune(text)[:maxRunes-suffixRunes]) + suffix
+}
+
+type retrievalFormatOptions struct {
+	Query            string
+	Keywords         []string
+	Candidates       []string
+	MaxEvidence      int
+	MaxEvidenceChars int
+	ContextBudget    int
+}
+
+func retrievalFormatOptionsFromConfig(cfg config.AgentConfig, query string, keywords []string, candidates []string) retrievalFormatOptions {
+	return retrievalFormatOptions{
+		Query:            strings.TrimSpace(query),
+		Keywords:         compactNonEmptyStrings(keywords),
+		Candidates:       compactNonEmptyStrings(candidates),
+		MaxEvidence:      normalizedRetrievalMaxEvidence(cfg),
+		MaxEvidenceChars: cfg.RetrievalEvidenceMaxChars,
+		ContextBudget:    normalizedRetrievalContextBudget(cfg),
+	}
+}
+
+func normalizedRetrievalMaxEvidence(cfg config.AgentConfig) int {
+	if cfg.RetrievalMaxEvidence > 0 {
+		return cfg.RetrievalMaxEvidence
+	}
+	return 8
+}
+
+func normalizedRetrievalContextBudget(cfg config.AgentConfig) int {
+	if cfg.RetrievalContextBudget > 0 {
+		return cfg.RetrievalContextBudget
+	}
+	return 6000
+}
+
+func normalizedReadDocumentMaxChars(cfg config.AgentConfig) int {
+	if cfg.ReadDocumentMaxChars > 0 {
+		return cfg.ReadDocumentMaxChars
+	}
+	return 10000
+}
+
+func formatRetrieveResultsForPrompt(resp *khclient.RetrieveResponse, opts retrievalFormatOptions) string {
+	if resp == nil || len(resp.Results) == 0 {
+		return ""
 	}
 
-	results := append([]khclient.RetrieveResult(nil), resp.List...)
+	results := append([]khclient.RetrieveResult(nil), resp.Results...)
 	sort.Slice(results, func(i, j int) bool {
 		return results[i].Score > results[j].Score
 	})
+	if opts.MaxEvidence > 0 && len(results) > opts.MaxEvidence {
+		results = results[:opts.MaxEvidence]
+	}
 
 	var sb strings.Builder
-	if len(candidates) > 0 {
-		fmt.Fprintf(&sb, "候选术语（用于消歧）: %s\n\n", strings.Join(candidates, " / "))
+	if opts.Query != "" {
+		fmt.Fprintf(&sb, "检索 query: %s\n", opts.Query)
 	}
+	if resp.Retrieval != nil {
+		fmt.Fprintf(&sb, "检索策略: %s, top_k=%d, candidate_top_k=%d, fallback=%t\n",
+			resp.Retrieval.Strategy, resp.Retrieval.TopK, resp.Retrieval.CandidateTopK, resp.Retrieval.FallbackUsed)
+	}
+	if len(opts.Candidates) > 0 {
+		fmt.Fprintf(&sb, "候选术语（用于消歧）: %s\n", strings.Join(opts.Candidates, " / "))
+	}
+	if sb.Len() > 0 {
+		sb.WriteString("\n")
+	}
+
 	for i, r := range results {
-		if i >= maxSnippets {
-			break
+		content := strings.TrimSpace(firstNonEmptyText(r.Content, r.Snippet))
+		if opts.MaxEvidenceChars > 0 {
+			content = focusSnippetForQuery(content, opts.Query, opts.Keywords, opts.MaxEvidenceChars)
 		}
-		content := focusSnippetForQuery(r.Content, rewrittenQuery, snippetKeywords, maxSnippetLen)
-		fmt.Fprintf(&sb, "片段 %d (相关度: %.2f):\n[来源: %s]\ndoc_id=%s\n%s\n\n",
-			i+1, r.Score, r.DocumentName, r.DocumentID, content)
-	}
-	return sb.String()
-}
-
-func deriveDisambiguationCandidates(results []khclient.RetrieveResult, query string, keywords []string, max int) []string {
-	if len(results) == 0 || max <= 0 {
-		return nil
-	}
-
-	queryTerms := map[string]struct{}{}
-	for _, t := range extractRetrieveKeywords(query) {
-		queryTerms[t] = struct{}{}
-	}
-	for _, t := range keywords {
-		t = strings.TrimSpace(t)
-		if t != "" {
-			queryTerms[t] = struct{}{}
+		if content == "" {
+			content = "(该证据没有可展示正文，请根据来源和 doc_id 调用 read_document 精读)"
 		}
-	}
 
-	blacklist := map[string]struct{}{
-		"功能": {}, "规则": {}, "说明": {}, "操作": {}, "页面": {}, "系统": {}, "平台": {}, "客户": {}, "接口": {}, "参数": {}, "方式": {}, "问题": {},
-		"文档": {}, "知识库": {}, "faq": {}, "xlsx": {}, "doc": {}, "docx": {}, "csv": {},
-	}
+		var block strings.Builder
+		fmt.Fprintf(&block, "证据 %d (相关度: %.2f", i+1, r.Score)
+		if r.EvidenceType != "" {
+			fmt.Fprintf(&block, ", 类型: %s", r.EvidenceType)
+		}
+		block.WriteString("):\n")
+		if r.DocumentName != "" {
+			fmt.Fprintf(&block, "来源: %s\n", r.DocumentName)
+		}
+		if r.VfsPath != "" {
+			fmt.Fprintf(&block, "路径: %s\n", r.VfsPath)
+		}
+		if r.StructurePath != "" && r.StructurePath != r.VfsPath {
+			fmt.Fprintf(&block, "结构路径: %s\n", r.StructurePath)
+		}
+		if r.DocumentID != "" {
+			fmt.Fprintf(&block, "doc_id=%s\n", r.DocumentID)
+		}
+		if r.AssetID != "" {
+			fmt.Fprintf(&block, "asset_id=%s\n", r.AssetID)
+		}
+		if r.PreviewURL != "" {
+			fmt.Fprintf(&block, "图片预览=%s\n", r.PreviewURL)
+		}
+		block.WriteString(content)
+		block.WriteString("\n\n")
 
-	termScore := map[string]float64{}
-	limit := minInt(len(results), 12)
-	for i := 0; i < limit; i++ {
-		r := results[i]
-		// 候选词只从正文抽取，避免把文件名/路径噪音带入 refined query
-		source := strings.TrimSpace(r.Content)
-		if source == "" {
-			continue
-		}
-		if utf8.RuneCountInString(source) > 300 {
-			source = string([]rune(source)[:300])
-		}
-		terms := extractRetrieveKeywords(source)
-		for _, term := range terms {
-			term = strings.TrimSpace(term)
-			if term == "" {
-				continue
+		next := block.String()
+		if opts.ContextBudget > 0 {
+			remaining := opts.ContextBudget - utf8.RuneCountInString(sb.String())
+			if remaining <= 160 {
+				break
 			}
-			if utf8.RuneCountInString(term) < 2 || utf8.RuneCountInString(term) > 10 {
-				continue
+			if utf8.RuneCountInString(next) > remaining {
+				next = trimTextByRunes(next, remaining, "\n...(证据已按上下文预算截断，可调用 read_document 精读全文)")
+				sb.WriteString(next)
+				break
 			}
-			if strings.ContainsAny(term, `/\._-`) {
-				continue
-			}
-			if _, skip := queryTerms[term]; skip {
-				continue
-			}
-			if _, skip := blacklist[term]; skip {
-				continue
-			}
-			termScore[term] += r.Score
 		}
+		sb.WriteString(next)
 	}
 
-	if len(termScore) == 0 {
-		return nil
-	}
-
-	type pair struct {
-		term  string
-		score float64
-	}
-	all := make([]pair, 0, len(termScore))
-	for term, score := range termScore {
-		all = append(all, pair{term: term, score: score})
-	}
-	sort.Slice(all, func(i, j int) bool {
-		if all[i].score == all[j].score {
-			return utf8.RuneCountInString(all[i].term) > utf8.RuneCountInString(all[j].term)
-		}
-		return all[i].score > all[j].score
-	})
-
-	out := make([]string, 0, minInt(max, len(all)))
-	for _, it := range all {
-		if len(out) >= max {
-			break
-		}
-		out = append(out, it.term)
-	}
-	return out
-}
-
-func mergeKeywordList(base []string, extra []string, max int) []string {
-	out := make([]string, 0, len(base)+len(extra))
-	seen := map[string]struct{}{}
-	appendTerm := func(v string) {
-		v = strings.TrimSpace(v)
-		if v == "" {
-			return
-		}
-		if _, ok := seen[v]; ok {
-			return
-		}
-		seen[v] = struct{}{}
-		out = append(out, v)
-	}
-	for _, v := range base {
-		appendTerm(v)
-	}
-	for _, v := range extra {
-		appendTerm(v)
-	}
-	if max > 0 && len(out) > max {
-		out = out[:max]
-	}
-	return out
-}
-
-func mergeRetrieveResults(primary []khclient.RetrieveResult, secondary []khclient.RetrieveResult, max int) []khclient.RetrieveResult {
-	merged := make([]khclient.RetrieveResult, 0, len(primary)+len(secondary))
-	seen := map[string]int{}
-	appendResult := func(r khclient.RetrieveResult) {
-		key := strings.TrimSpace(r.DocumentID) + "|" + strings.TrimSpace(r.Content)
-		if key == "|" {
-			key = strings.TrimSpace(r.DocumentName) + "|" + strings.TrimSpace(r.VfsPath)
-		}
-		if idx, ok := seen[key]; ok {
-			if r.Score > merged[idx].Score {
-				merged[idx] = r
-			}
-			return
-		}
-		seen[key] = len(merged)
-		merged = append(merged, r)
-	}
-	for _, r := range primary {
-		appendResult(r)
-	}
-	for _, r := range secondary {
-		appendResult(r)
-	}
-	sort.Slice(merged, func(i, j int) bool {
-		return merged[i].Score > merged[j].Score
-	})
-	if max > 0 && len(merged) > max {
-		merged = merged[:max]
-	}
-	return merged
-}
-
-func minInt(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
+	return strings.TrimSpace(sb.String())
 }
 
 func extractRetrieveKeywords(query string) []string {
@@ -451,78 +297,6 @@ func extractRetrieveKeywords(query string) []string {
 	return out
 }
 
-func enrichRetrieveKeywords(query string, base []string) []string {
-	out := make([]string, 0, len(base)+1)
-	seen := map[string]struct{}{}
-	add := func(v string) {
-		v = strings.TrimSpace(v)
-		if v == "" {
-			return
-		}
-		if _, ok := seen[v]; ok {
-			return
-		}
-		seen[v] = struct{}{}
-		out = append(out, v)
-	}
-	phrase := normalizeQueryPhrase(query)
-	if phrase != "" {
-		add(phrase)
-	}
-	for _, kw := range base {
-		add(kw)
-	}
-	return out
-}
-
-func normalizeQueryPhrase(query string) string {
-	q := strings.TrimSpace(query)
-	if q == "" {
-		return ""
-	}
-	replacer := strings.NewReplacer(
-		"，", " ", ",", " ", "。", " ", ".", " ",
-		"？", " ", "?", " ", "！", " ", "!", " ",
-		"；", " ", ";", " ", "：", " ", ":", " ",
-		"（", " ", "）", " ", "(", " ", ")", " ",
-		"【", " ", "】", " ", "[", " ", "]", " ",
-	)
-	q = replacer.Replace(q)
-	q = strings.Join(strings.Fields(q), " ")
-	if q == "" {
-		return ""
-	}
-	r := utf8.RuneCountInString(q)
-	if r < 4 || r > 24 {
-		return ""
-	}
-	return q
-}
-
-func enhanceQueryWithHistory(query string, history []model.Message) string {
-	trimmed := strings.TrimSpace(query)
-	if trimmed == "" || isQuestionLike(trimmed) {
-		return trimmed
-	}
-
-	for i := len(history) - 1; i >= 0; i-- {
-		msg := history[i]
-		if msg.Role != "user" {
-			continue
-		}
-		prev := strings.TrimSpace(msg.Content)
-		if prev == "" || !isQuestionLike(prev) {
-			continue
-		}
-		if strings.Contains(prev, trimmed) {
-			return prev
-		}
-		return prev + " " + trimmed
-	}
-
-	return trimmed
-}
-
 func isQuestionLike(text string) bool {
 	t := strings.TrimSpace(text)
 	if t == "" {
@@ -541,6 +315,9 @@ func isQuestionLike(text string) bool {
 }
 
 func focusSnippetForQuery(content string, query string, keywords []string, maxSnippetLen int) string {
+	if maxSnippetLen <= 0 {
+		return content
+	}
 	runes := []rune(content)
 	if len(runes) <= maxSnippetLen {
 		return content
@@ -617,15 +394,21 @@ func (s *Service) buildMessages(ctx context.Context, req *Request) []chatMessage
 	}
 	slog.Info("[agent] history loaded", "conv_id", req.ConversationID, "count", len(history))
 
+	history = dropCurrentRequestFromHistory(history, req)
+	filteredHistory := filterResolvedHistoryForCurrentTurn(history, 6)
+	if len(filteredHistory) != len(history) {
+		slog.Info("[agent] resolved history pruned", "original", len(history), "kept", len(filteredHistory))
+	}
+
 	// 转换为 chatMessage 并应用距离衰减裁剪
 	var historyMsgs []chatMessage
-	for _, msg := range history {
+	for _, msg := range filteredHistory {
 		content := msg.Content
 		// 群聊场景：user 消息注入发言人标识，让 LLM 知道是谁在说话
 		if msg.Role == "user" && msg.SenderName != "" {
 			content = fmt.Sprintf("[%s]: %s", msg.SenderName, content)
 		} else if msg.Role == "user" && msg.SenderID != "" {
-			content = fmt.Sprintf("[用户 %s]: %s", msg.SenderID[:8], content)
+			content = fmt.Sprintf("[用户 %s]: %s", shortID(msg.SenderID), content)
 		}
 		historyMsgs = append(historyMsgs, chatMessage{
 			Role:    msg.Role,
@@ -643,7 +426,7 @@ func (s *Service) buildMessages(ctx context.Context, req *Request) []chatMessage
 	if req.SenderName != "" {
 		userContent = fmt.Sprintf("[%s]: %s", req.SenderName, userContent)
 	} else if req.SenderID != "" {
-		userContent = fmt.Sprintf("[用户 %s]: %s", req.SenderID[:8], userContent)
+		userContent = fmt.Sprintf("[用户 %s]: %s", shortID(req.SenderID), userContent)
 	}
 	slog.Info("[agent] current query", "content", userContent)
 	messages = append(messages, chatMessage{
@@ -652,6 +435,68 @@ func (s *Service) buildMessages(ctx context.Context, req *Request) []chatMessage
 	})
 
 	return messages
+}
+
+func dropCurrentRequestFromHistory(history []model.Message, req *Request) []model.Message {
+	if len(history) == 0 || req == nil {
+		return history
+	}
+	last := history[len(history)-1]
+	if last.Role != "user" {
+		return history
+	}
+	if strings.TrimSpace(last.Content) != strings.TrimSpace(req.UserQuery) {
+		return history
+	}
+	if strings.TrimSpace(req.SenderID) != "" && strings.TrimSpace(last.SenderID) != strings.TrimSpace(req.SenderID) {
+		return history
+	}
+	return history[:len(history)-1]
+}
+
+func filterResolvedHistoryForCurrentTurn(history []model.Message, preserveTail int) []model.Message {
+	if preserveTail < 0 {
+		preserveTail = 0
+	}
+	cutoff := len(history) - preserveTail
+	if cutoff <= 0 {
+		return history
+	}
+
+	drop := make([]bool, len(history))
+	for i := 0; i < cutoff; {
+		if history[i].Role != "user" {
+			i++
+			continue
+		}
+
+		start := i
+		for i < cutoff && history[i].Role == "user" {
+			i++
+		}
+
+		hasAssistantReply := false
+		for i < cutoff && history[i].Role != "user" {
+			if history[i].Role == "assistant" {
+				hasAssistantReply = true
+			}
+			i++
+		}
+		if !hasAssistantReply {
+			continue
+		}
+		for j := start; j < i; j++ {
+			drop[j] = true
+		}
+	}
+
+	filtered := make([]model.Message, 0, len(history))
+	for i, msg := range history {
+		if !drop[i] {
+			filtered = append(filtered, msg)
+		}
+	}
+	return filtered
 }
 
 func (s *Service) buildRuntimeTools(groupID string) []turnmesh.Tool {
@@ -690,6 +535,14 @@ func runtimeMessages(messages []chatMessage) []turnmesh.Message {
 		})
 	}
 	return out
+}
+
+func shortID(id string) string {
+	id = strings.TrimSpace(id)
+	if len(id) <= 8 {
+		return id
+	}
+	return id[:8]
 }
 
 func extractClarification(results []turnmesh.ToolResult) string {
@@ -740,6 +593,13 @@ func turnmeshErrorLogAttrs(err error) []any {
 	return attrs
 }
 
+func replyLengthInstruction(maxLen int) string {
+	if maxLen > 0 {
+		return fmt.Sprintf("简洁明了，3-5 句话，字数尽量不超过 %d 字；但不要为了压缩而省略关键步骤或必要条件", maxLen)
+	}
+	return "简洁明了，优先完整准确；简单问题 3-5 句话，涉及步骤、条件或排障时允许适度展开，不要为了压缩而省略关键信息"
+}
+
 // executeToolSafe 带超时和 panic 恢复的工具执行
 // 防止单个工具调用阻塞整个 Agent 循环或因 panic 导致进程崩溃
 func (s *Service) executeToolSafe(ctx context.Context, call ToolCall, groupID string) string {
@@ -769,51 +629,6 @@ func (s *Service) executeToolSafe(ctx context.Context, call ToolCall, groupID st
 		slog.Warn("[agent] tool timeout", "tool", call.Name, "timeout", timeout)
 		return fmt.Sprintf("工具 %s 执行超时，请忽略此工具结果继续回答", call.Name)
 	}
-}
-
-// degradeToPreSearch LLM 不可用时，基于预检索结果构造降级回复
-func (s *Service) degradeToPreSearch(preSearchResult string) string {
-	lines := strings.Split(preSearchResult, "\n")
-	var contentParts []string
-
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if line == "" {
-			continue
-		}
-		// 跳过元数据行，只保留正文内容
-		if strings.HasPrefix(line, "片段 ") ||
-			strings.HasPrefix(line, "[来源:") ||
-			strings.HasPrefix(line, "doc_id=") ||
-			strings.HasPrefix(line, "候选术语") {
-			continue
-		}
-		contentParts = append(contentParts, line)
-	}
-
-	if len(contentParts) == 0 {
-		return "系统暂时繁忙，请稍后再试。"
-	}
-
-	var sb strings.Builder
-	sb.WriteString("系统查询显示，以下是知识库中相关的参考信息：\n\n")
-	totalRunes := 0
-	maxRunes := 500
-	if s.cfg.ReplyMaxLength > 0 && s.cfg.ReplyMaxLength-50 > 0 {
-		maxRunes = s.cfg.ReplyMaxLength - 50
-	}
-
-	for _, part := range contentParts {
-		partLen := utf8.RuneCountInString(part)
-		if totalRunes+partLen > maxRunes {
-			break
-		}
-		sb.WriteString(part)
-		sb.WriteString("\n")
-		totalRunes += partLen
-	}
-
-	return strings.TrimSpace(sb.String())
 }
 
 // checkReplyQuality 检查 LLM 回复质量：超长回复在句末截断
@@ -869,13 +684,13 @@ func BuildSystemPrompt(group *model.EnterpriseGroup, agentCfg config.AgentConfig
 
 ## 核心规则：基于知识库回答（不可绕过）
 
-系统已经自动用用户的问题检索了知识库，检索结果会附在消息末尾。你必须基于这些检索结果回答，严禁用自己的训练知识编造答案。
+回答产品、功能、配置、接口、报错、操作步骤等知识库问题前，必须先调用 search_knowledge 检索知识库。严禁跳过检索直接用自己的训练知识编造答案。
 
 ### 工作流
-1. **理解问题**：结合会话历史理解用户真正在问什么。消息格式为 [用户名]: 内容。
-2. **阅读检索结果**：系统已自动检索，结果在消息中。仔细阅读所有片段。
-3. **精读文档**：如果检索到的片段信息不完整，调用 read_document 读取全文。
-4. **补充检索**：如果自动检索的结果不够精准，可以调用 search_knowledge 用更精确的关键词重新检索。
+1. **理解并改写问题**：当前最后一条 user 消息是唯一需要回答的问题。结合会话历史理解客户真正想问什么，消息格式为 [用户名]: 内容；如果历史里出现 [图片观察]，它表示客户图片/截图的视觉摘要和 OCR 线索。不要把当前消息原文直接检索；先在心里把“这个/那个/上面说的/不对啊”等上下文依赖表达改写成完整问题。
+2. **主动检索**：用 search_knowledge 提交改写后的自包含 query；keywords 只放错误码、接口名、产品名等硬关键词。如果是内部同事 @你代答客户问题，query 应围绕客户原问题，而不是内部同事的转述动作。
+3. **精读文档**：如果检索证据不完整、步骤被截断或需要确认上下文，调用 read_document 读取全文。
+4. **补充检索**：如果第一次检索不够精准，改写 query 或删减 keywords 后再检索。
 5. **基于检索结果回答**：只用检索到的内容作答，严禁编造。
 6. **无相关结果时**：不要输出 [NO_ANSWER]。请明确告知“当前知识库未检索到明确答案”，并追问一个关键补充信息（功能页面、接口名、报错关键词三选一）。如果检索里出现了多个候选术语，优先让用户在 2-3 个候选中确认，而不是泛泛追问。
 
@@ -883,9 +698,12 @@ func BuildSystemPrompt(group *model.EnterpriseGroup, agentCfg config.AgentConfig
 - 客户不会每个问题都 @你，他们可能聊了几句之后才 @你。你必须结合会话历史理解完整上下文。
 - 当内部同事 @你时，是希望你帮忙回答客户之前提出的问题，回溯上文找到真正的问题。
 - 客户提问通常很模糊（"这个怎么弄"、"不对啊"），结合上下文推断具体功能和操作。
+- 历史中已经被 assistant 回复过的旧问题只作为背景，不得再次当作当前要回答的问题；除非当前最后一条 user 消息明确引用、复述或要求重答那个旧问题。
+- 如果当前消息只是“重新理解我的问题”“我没发图片”“不是这个”等纠偏表达，优先回到最近一轮未解决的明确问题；不要跳到更早、已经回复过的历史问题。
+- 客户发图片时，[图片观察] 只是理解截图的辅助线索，不是知识库答案。必须把图片里的页面名、错误码、按钮名、可见文字等改写成 search_knowledge query，再基于检索结果回答。
 
 ## 回复要求
-- 简洁明了，3-5 句话，字数绝对不超过 %d 字
+- %s
 - 只回答用户问的问题，不要主动扩展、不要提供额外建议
 - 如果回答基于知识库，必须在正文开头或合适位置说明“根据知识库显示”或“系统查询显示”等引导语
 - 严禁在回复末尾加引导语（如"如果还有问题随时问我"、"如果需要可以说下具体场景"等）
@@ -896,5 +714,5 @@ func BuildSystemPrompt(group *model.EnterpriseGroup, agentCfg config.AgentConfig
 ## 格式要求（严格遵守）
 - 回复内容不要使用任何 Markdown 格式符号，包括但不限于：**加粗**、*斜体*、# 标题、- 列表符号、代码块等
 - 使用纯文本回复，用换行和数字序号来组织内容（如 1. 2. 3.）
-- 不要原封不动地复制知识库原文，要用自己的话重新组织和润色，让回复自然流畅，像真人在对话`, group.CustomerName, group.FeatureTag, agentCfg.ReplyMaxLength)
+- 不要原封不动地复制知识库原文，要用自己的话重新组织和润色，让回复自然流畅，像真人在对话`, group.CustomerName, group.FeatureTag, replyLengthInstruction(agentCfg.ReplyMaxLength))
 }

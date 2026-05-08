@@ -12,6 +12,7 @@ import (
 	"git.pinquest.cn/ai-customer/internal/config"
 	"git.pinquest.cn/ai-customer/internal/data"
 	"git.pinquest.cn/ai-customer/internal/dispatcher"
+	"git.pinquest.cn/ai-customer/internal/imagectx"
 	"git.pinquest.cn/ai-customer/internal/khclient"
 	"git.pinquest.cn/ai-customer/internal/message"
 	"git.pinquest.cn/ai-customer/internal/router"
@@ -29,14 +30,15 @@ func InitializeServer(cfg *config.Config) (*gin.Engine, error) {
 		return nil, err
 	}
 	groupStore := store.NewGroupStore(db)
-	toolExecutor := agent.NewToolExecutor(client, groupStore)
+	toolExecutor := agent.NewToolExecutor(cfg, client, groupStore)
 	messageStore := store.NewMessageStore(db)
-	service := ProvideAgentService(cfg, toolExecutor, client, groupStore, messageStore)
+	service := ProvideAgentService(cfg, toolExecutor, messageStore)
 	wecomClient := ProvideWecomClient(cfg)
 	groupMemberStore := store.NewGroupMemberStore(db)
 	robotStore := store.NewRobotStore(db)
 	conversationStore := store.NewConversationStore(db)
-	handler := ProvideMessageHandler(service, cfg, wecomClient, groupStore, groupMemberStore, robotStore, conversationStore, messageStore)
+	observer := ProvideImageObserver(cfg)
+	handler := ProvideMessageHandler(service, cfg, wecomClient, groupStore, groupMemberStore, robotStore, conversationStore, messageStore, observer)
 	dispatcher := ProvideDispatcher(handler, robotStore, groupStore, groupMemberStore, wecomClient)
 	callbackHandler := ProvideCallbackHandler(cfg, dispatcher)
 	engine := router.SetupRouter(callbackHandler, groupStore, robotStore, client, wecomClient)
@@ -53,8 +55,12 @@ func ProvideKHClient(cfg *config.Config) *khclient.Client {
 	return khclient.NewClient(cfg.KnowledgeHub.Host, cfg.KnowledgeHub.APIKey, cfg.KnowledgeHub.Timeout)
 }
 
-func ProvideAgentService(cfg *config.Config, executor *agent.ToolExecutor, kh *khclient.Client, gs *store.GroupStore, msgStore *store.MessageStore) *agent.Service {
-	return agent.NewService(cfg.Agent, executor, kh, gs, msgStore)
+func ProvideImageObserver(cfg *config.Config) imagectx.Observer {
+	return imagectx.NewObserver(cfg.Agent)
+}
+
+func ProvideAgentService(cfg *config.Config, executor *agent.ToolExecutor, msgStore *store.MessageStore) *agent.Service {
+	return agent.NewService(cfg.Agent, executor, msgStore)
 }
 
 func ProvideMessageHandler(
@@ -66,8 +72,9 @@ func ProvideMessageHandler(
 	rs *store.RobotStore,
 	cs *store.ConversationStore,
 	ms *store.MessageStore,
+	imageObserver imagectx.Observer,
 ) *message.Handler {
-	return message.NewHandler(agentSvc, cfg.Agent, wc, gs, gms, rs, cs, ms)
+	return message.NewHandler(agentSvc, cfg.Agent, wc, gs, gms, rs, cs, ms, imageObserver)
 }
 
 func ProvideDispatcher(mh *message.Handler, rs *store.RobotStore, gs *store.GroupStore, gms *store.GroupMemberStore, wc *wecom.Client) *dispatcher.Dispatcher {

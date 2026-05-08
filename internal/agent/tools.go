@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 
+	"git.pinquest.cn/ai-customer/internal/config"
 	"git.pinquest.cn/ai-customer/internal/khclient"
 	"git.pinquest.cn/ai-customer/internal/store"
 )
@@ -26,12 +27,13 @@ type ToolCall struct {
 
 // ToolExecutor 负责实际执行工具调用
 type ToolExecutor struct {
+	cfg        config.AgentConfig
 	khClient   *khclient.Client
 	groupStore *store.GroupStore
 }
 
-func NewToolExecutor(kh *khclient.Client, gs *store.GroupStore) *ToolExecutor {
-	return &ToolExecutor{khClient: kh, groupStore: gs}
+func NewToolExecutor(cfg *config.Config, kh *khclient.Client, gs *store.GroupStore) *ToolExecutor {
+	return &ToolExecutor{cfg: cfg.Agent, khClient: kh, groupStore: gs}
 }
 
 // Execute 执行工具调用，返回结果文本
@@ -52,27 +54,24 @@ func (e *ToolExecutor) Execute(ctx context.Context, call ToolCall, groupID strin
 
 func (e *ToolExecutor) searchKnowledge(ctx context.Context, argsJSON string, groupID string) string {
 	var args struct {
-		SemanticQuery string   `json:"semantic_query"`
-		Keywords      []string `json:"keywords"`
-		Strategy      string   `json:"strategy"`
+		Query          string   `json:"query"`
+		SemanticQuery  string   `json:"semantic_query"`
+		Keywords       []string `json:"keywords"`
+		Strategy       string   `json:"strategy"`
+		TopK           *int     `json:"top_k"`
+		Threshold      *float64 `json:"threshold"`
+		ScoreThreshold *float64 `json:"score_threshold"`
 	}
 	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil {
 		return "参数解析错误: " + err.Error()
 	}
 
-	query := strings.TrimSpace(args.SemanticQuery)
+	query := strings.TrimSpace(args.Query)
 	if query == "" {
-		return "参数错误: semantic_query 不能为空"
+		query = strings.TrimSpace(args.SemanticQuery)
 	}
-
-	// 决定检索策略
-	strategy := args.Strategy
-	if strategy == "" {
-		if len(args.Keywords) > 0 {
-			strategy = "hybrid"
-		} else {
-			strategy = "semantic"
-		}
+	if query == "" {
+		return "参数错误: query 不能为空"
 	}
 
 	// 获取群组关联的 dataset_ids
@@ -81,43 +80,35 @@ func (e *ToolExecutor) searchKnowledge(ctx context.Context, argsJSON string, gro
 		datasetIDs = group.DatasetIDs
 	}
 
-	// 构造查询：keyword 模式下关键词作为主查询，其他模式语义查询为主
-	searchQuery := query
-	if strategy == "keyword" && len(args.Keywords) > 0 {
-		searchQuery = strings.Join(args.Keywords, " ")
+	retrieveReq := &khclient.RetrieveRequest{
+		Query:      query,
+		DatasetIDs: datasetIDs,
+		Keywords:   compactNonEmptyStrings(args.Keywords),
 	}
-	keywords := enrichRetrieveKeywords(query, args.Keywords)
-
-	topK := 20
-	if strategy == "hybrid" {
-		topK = 120
+	if args.Strategy != "" {
+		retrieveReq.SearchStrategy = args.Strategy
+	}
+	if args.TopK != nil && *args.TopK > 0 {
+		retrieveReq.TopK = *args.TopK
+	}
+	threshold := args.Threshold
+	if threshold == nil {
+		threshold = args.ScoreThreshold
+	}
+	if threshold != nil && *threshold > 0 {
+		retrieveReq.ScoreThreshold = *threshold
 	}
 
-	resp, err := e.khClient.Retrieve(ctx, &khclient.RetrieveRequest{
-		Query:          searchQuery,
-		DatasetIDs:     datasetIDs,
-		Keywords:       keywords,
-		TopK:           topK,
-		ScoreThreshold: 0.2,
-		SearchStrategy: strategy,
-	})
+	resp, err := e.khClient.Retrieve(ctx, retrieveReq)
 	if err != nil {
 		return "知识库检索失败: " + err.Error()
 	}
 
-	if len(resp.List) == 0 {
-		return "未找到相关结果。请尝试改写 semantic_query 或删减 keywords 后重试。"
+	if len(resp.Results) == 0 {
+		return "未找到相关结果。请尝试改写 query 或删减 keywords 后重试。"
 	}
 
-	var sb strings.Builder
-	for i, r := range resp.List {
-		if i >= 8 {
-			break
-		}
-		fmt.Fprintf(&sb, "片段 %d (Score: %.4f):\n[来源: %s] %s\ndoc_id=%s\n%s\n\n",
-			i+1, r.Score, r.DocumentName, r.VfsPath, r.DocumentID, r.Content)
-	}
-	return sb.String()
+	return formatRetrieveResultsForPrompt(resp, retrievalFormatOptionsFromConfig(e.cfg, query, compactNonEmptyStrings(args.Keywords), nil))
 }
 
 func (e *ToolExecutor) readDocument(ctx context.Context, argsJSON string) string {
@@ -133,10 +124,7 @@ func (e *ToolExecutor) readDocument(ctx context.Context, argsJSON string) string
 		return "文档读取失败: " + err.Error()
 	}
 
-	content := doc.Content
-	if len(content) > 3000 {
-		content = content[:3000] + "\n...(内容已截断)"
-	}
+	content := trimTextByRunes(doc.Content, normalizedReadDocumentMaxChars(e.cfg), "\n...(文档内容已按工具预算截断；如仍缺关键信息，请结合检索结果继续缩小问题范围)")
 	return fmt.Sprintf("文档: %s\n\n%s", doc.Name, content)
 }
 
@@ -165,17 +153,21 @@ func DefinedTools() []Tool {
 	return []Tool{
 		{
 			Name: "search_knowledge",
-			Description: `在企业知识库中检索相关文档片段。
+			Description: `在企业知识库中检索相关文档片段。默认把 query 交给 Knowledge Hub RAG 自动选择召回策略，不要主动指定 strategy、top_k 或 threshold，除非用户明确要求限制检索方式、数量或阈值。
 使用此工具前，你必须仔细分析用户的原始输入：
 1. 不要把用户的原话直接作为查询条件。
-2. 必须区分出哪些是需要语义理解的内容（填入 semantic_query），哪些是必须精确匹配的字眼（填入 keywords）。
-3. 如果第一次搜索无结果，严禁直接回复找不到。你必须删减 keywords 或改写 semantic_query，至少重试 2 次后才能放弃。`,
+2. 必须结合聊天历史判断客户真正想问什么，把“这个/那个/上面说的/不对啊”等上下文依赖表达改写成自包含 query。
+3. 如果是内部同事 @你代答客户问题，query 应围绕客户原问题，而不是内部同事的转述动作。
+4. 已经被 assistant 回复过的旧问题只作为背景，不能当作当前检索 query；除非当前最后一条 user 消息明确引用、复述或要求重答那个旧问题。
+5. 如果历史里出现 [图片观察]，把图片中的页面名、错误码、按钮名、可见文字、可能问题转成 query 和 keywords，不要把“图片观察”四个字本身拿去检索。
+6. keywords 只填写用户明确提到且必须精确匹配的词。
+7. 如果第一次搜索无结果，严禁直接回复找不到。你必须删减 keywords 或改写 query，至少重试 2 次后才能放弃。`,
 			Parameters: map[string]any{
 				"type": "object",
 				"properties": map[string]any{
-					"semantic_query": map[string]any{
+					"query": map[string]any{
 						"type":        "string",
-						"description": "用于向量匹配的纯净语义查询。必须剥离用户输入中的无意义语气词（如'帮我查一下'），并补全上下文代词。",
+						"description": "传给 Knowledge Hub RAG 的自包含查询。这是你结合聊天历史重写后的真实问题，不是用户原话；必须剥离寒暄、@人、转述语，并补全上下文代词。",
 					},
 					"keywords": map[string]any{
 						"type":  "array",
@@ -185,11 +177,19 @@ func DefinedTools() []Tool {
 					},
 					"strategy": map[string]any{
 						"type":        "string",
-						"enum":        []string{"semantic", "keyword", "hybrid"},
-						"description": "检索策略。概念理解或模糊意图选 semantic；查具体错误码或特定名称选 keyword；不确定选 hybrid。",
+						"enum":        []string{"semantic", "keyword", "hybrid", "auto"},
+						"description": "可选检索策略。默认不要填写，交给 Knowledge Hub RAG 自动选择；仅当用户明确要求某种检索方式时填写。",
+					},
+					"top_k": map[string]any{
+						"type":        "integer",
+						"description": "可选返回数量。默认不要填写，交给 Knowledge Hub RAG 决定；仅当用户明确要求数量时填写。",
+					},
+					"threshold": map[string]any{
+						"type":        "number",
+						"description": "可选分数阈值。默认不要填写，交给 Knowledge Hub RAG 决定；仅当用户明确要求阈值时填写。",
 					},
 				},
-				"required": []string{"semantic_query"},
+				"required": []string{"query"},
 			},
 		},
 		{

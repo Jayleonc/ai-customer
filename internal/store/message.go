@@ -39,6 +39,17 @@ func (s *MessageStore) Create(ctx context.Context, msg *model.Message) (bool, er
 	return true, nil
 }
 
+func (s *MessageStore) GetByWecomMsgID(ctx context.Context, wecomMsgID string) (*model.Message, error) {
+	var msg model.Message
+	err := s.db.WithContext(ctx).
+		Where("wecom_msg_id = ?", wecomMsgID).
+		First(&msg).Error
+	if err != nil {
+		return nil, err
+	}
+	return &msg, nil
+}
+
 // ListRecent 获取最近 N 条消息（用于注入 Agent 历史）
 func (s *MessageStore) ListRecent(ctx context.Context, conversationID string, limit int) ([]model.Message, error) {
 	var messages []model.Message
@@ -86,6 +97,27 @@ func (s *MessageStore) ListRecentByGroupAndSender(ctx context.Context, groupID, 
 		Select("m.*").
 		Joins(`JOIN "conversation" c ON c.id = m.conversation_id`).
 		Where("c.group_id = ? AND m.role = ? AND m.sender_id = ?", groupID, "user", senderID).
+		Order("m.created_at DESC").
+		Limit(limit).
+		Find(&messages).Error
+	if err != nil {
+		return nil, err
+	}
+	// 反转为时间正序
+	for i, j := 0, len(messages)-1; i < j; i, j = i+1, j-1 {
+		messages[i], messages[j] = messages[j], messages[i]
+	}
+	return messages, nil
+}
+
+// ListRecentConversationByGroupAndSender 获取某个群内某个发送者会话的最近消息（包含 user/assistant）。
+func (s *MessageStore) ListRecentConversationByGroupAndSender(ctx context.Context, groupID, senderID string, limit int) ([]model.Message, error) {
+	var messages []model.Message
+	err := s.db.WithContext(ctx).
+		Table(`"message" AS m`).
+		Select("m.*").
+		Joins(`JOIN "conversation" c ON c.id = m.conversation_id`).
+		Where("c.group_id = ? AND c.sender_id = ? AND c.status = ?", groupID, senderID, "active").
 		Order("m.created_at DESC").
 		Limit(limit).
 		Find(&messages).Error

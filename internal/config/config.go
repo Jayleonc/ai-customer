@@ -59,20 +59,25 @@ type AgentConfig struct {
 	HistoryLimit   int     `mapstructure:"history_limit"`
 	ReplyMaxLength int     `mapstructure:"reply_max_length"`
 
-	// 预检索配置
-	PreSearchStrategy         string  `mapstructure:"pre_search_strategy"`           // 预检索策略：semantic / keyword / hybrid（默认 hybrid）
-	PreSearchTopK             int     `mapstructure:"pre_search_top_k"`              // 预检索返回数量（默认 20）
-	PreSearchScoreThreshold   float64 `mapstructure:"pre_search_score_threshold"`    // 预检索分数阈值（默认 0.3）
-	PreSearchMaxSnippets      int     `mapstructure:"pre_search_max_snippets"`       // 注入 context 的最大片段数（默认 5）
-	PreSearchMaxSnippetLength int     `mapstructure:"pre_search_max_snippet_length"` // 每个片段最大字数（默认 300）
+	// 图片理解配置：客户发图时，先把图片观察成可检索的客服上下文
+	ImageUnderstandingMode string `mapstructure:"image_understanding_mode"` // observe / disabled
+	VisionProvider         string `mapstructure:"vision_provider"`
+	VisionBaseURL          string `mapstructure:"vision_base_url"`
+	VisionAPIKey           string `mapstructure:"vision_api_key"`
+	VisionModel            string `mapstructure:"vision_model"`
+	VisionDetail           string `mapstructure:"vision_detail"`
+	VisionTimeoutSeconds   int    `mapstructure:"vision_timeout_seconds"`
+	VisionImageMaxBytes    int64  `mapstructure:"vision_image_max_bytes"`
 
-	// Query Rewrite 配置
-	QueryRewriteMode  string `mapstructure:"query_rewrite_mode"`  // 重写模式：llm（默认）/ disabled（关闭）
-	QueryRewriteModel string `mapstructure:"query_rewrite_model"` // LLM 重写使用的模型（空则复用主模型）
+	// 检索工具输出配置
+	RetrievalMaxEvidence      int `mapstructure:"retrieval_max_evidence"`       // search_knowledge 最大证据数（默认 8）
+	RetrievalEvidenceMaxChars int `mapstructure:"retrieval_evidence_max_chars"` // 单条证据最大字数；0 表示不做单条硬截断
+	RetrievalContextBudget    int `mapstructure:"retrieval_context_budget"`     // search_knowledge 工具输出总字数预算（默认 6000）
+	ReadDocumentMaxChars      int `mapstructure:"read_document_max_chars"`      // read_document 最大返回字数（默认 10000）
 
 	// Runtime 配置
-	TokenBudget        int `mapstructure:"token_budget"`         // 单次 LLM 调用最大输入 token 数（默认 6000）
-	ToolTimeoutSeconds int `mapstructure:"tool_timeout_seconds"` // 工具调用超时秒数（默认 30）
+	TokenBudget        int `mapstructure:"token_budget"`         // 单次 LLM 调用最大输入 token 数（默认 10000）
+	ToolTimeoutSeconds int `mapstructure:"tool_timeout_seconds"` // 工具调用超时秒数（默认 60）
 }
 
 func LoadConfig(configPath ...string) (*Config, error) {
@@ -124,14 +129,44 @@ func LoadConfig(configPath ...string) (*Config, error) {
 	if cfg.Agent.HistoryLimit <= 0 {
 		cfg.Agent.HistoryLimit = 20
 	}
-	if cfg.Agent.ReplyMaxLength <= 0 {
-		cfg.Agent.ReplyMaxLength = 800
+	if cfg.Agent.ImageUnderstandingMode == "" {
+		cfg.Agent.ImageUnderstandingMode = "observe"
+	}
+	if cfg.Agent.VisionProvider == "" {
+		cfg.Agent.VisionProvider = "openai"
+	}
+	if cfg.Agent.VisionBaseURL == "" {
+		cfg.Agent.VisionBaseURL = cfg.Agent.BaseURL
+	}
+	if cfg.Agent.VisionAPIKey == "" {
+		cfg.Agent.VisionAPIKey = cfg.Agent.APIKey
+	}
+	if cfg.Agent.VisionModel == "" {
+		cfg.Agent.VisionModel = cfg.Agent.Model
+	}
+	if cfg.Agent.VisionDetail == "" {
+		cfg.Agent.VisionDetail = "low"
+	}
+	if cfg.Agent.VisionTimeoutSeconds <= 0 {
+		cfg.Agent.VisionTimeoutSeconds = 60
+	}
+	if cfg.Agent.VisionImageMaxBytes <= 0 {
+		cfg.Agent.VisionImageMaxBytes = 5 * 1024 * 1024
 	}
 	if cfg.Agent.TokenBudget <= 0 {
-		cfg.Agent.TokenBudget = 6000
+		cfg.Agent.TokenBudget = 10000
 	}
 	if cfg.Agent.ToolTimeoutSeconds <= 0 {
-		cfg.Agent.ToolTimeoutSeconds = 30
+		cfg.Agent.ToolTimeoutSeconds = 60
+	}
+	if cfg.Agent.RetrievalMaxEvidence <= 0 {
+		cfg.Agent.RetrievalMaxEvidence = 8
+	}
+	if cfg.Agent.RetrievalContextBudget <= 0 {
+		cfg.Agent.RetrievalContextBudget = 6000
+	}
+	if cfg.Agent.ReadDocumentMaxChars <= 0 {
+		cfg.Agent.ReadDocumentMaxChars = 10000
 	}
 
 	fmt.Printf("Configuration loaded from %s\n", v.ConfigFileUsed())

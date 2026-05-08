@@ -88,15 +88,15 @@ func truncateToFirstSentence(text string, maxRunes int) string {
 	return text
 }
 
-// trimMessagesToBudget 当总 token 超预算时，从最老的历史消息开始裁剪
-// 保护首条 system 消息和最后 2 条消息（当前 user + preSearch）不被裁剪
+// trimMessagesToBudget 当总 token 超预算时，从最老的历史消息开始裁剪。
+// 保护首条 system 消息和最后的当前 user 消息不被裁剪。
 func trimMessagesToBudget(messages []chatMessage, maxTokens int) []chatMessage {
 	if maxTokens <= 0 || estimateMessagesTokens(messages) <= maxTokens {
 		return messages
 	}
 
-	// 从 index 1（最老的历史）开始删，保留至少 3 条（system + user + preSearch）
-	for estimateMessagesTokens(messages) > maxTokens && len(messages) > 3 {
+	// 从 index 1（最老的历史）开始删，保留至少 system + current user。
+	for estimateMessagesTokens(messages) > maxTokens && len(messages) > 2 {
 		messages = append(messages[:1], messages[2:]...)
 	}
 	return messages

@@ -26,7 +26,7 @@ func NewClient(host, apiKey string, timeoutSec int) *Client {
 	}
 }
 
-// ---- 语义检索 ----
+// ---- RAG 检索 ----
 
 type RetrieveRequest struct {
 	Query          string   `json:"query"`
@@ -34,23 +34,74 @@ type RetrieveRequest struct {
 	Keywords       []string `json:"keywords,omitempty"`
 	TopK           int      `json:"top_k,omitempty"`
 	ScoreThreshold float64  `json:"score_threshold,omitempty"`
-	SearchStrategy string   `json:"search_strategy,omitempty"` // semantic / keyword / hybrid
+	SearchStrategy string   `json:"search_strategy,omitempty"` // semantic / keyword / hybrid / auto
 	ReRank         bool     `json:"re_rank,omitempty"`         // 是否对结果做二次重排序
 }
 
 type RetrieveResult struct {
-	ID           string   `json:"id"`
-	DocumentID   string   `json:"document_id"`
-	DocumentName string   `json:"document_name"`
-	Content      string   `json:"content"`
-	Snippet      string   `json:"snippet"`
-	Score        float64  `json:"score"`
-	HeaderPath   []string `json:"header_path"`
-	VfsPath      string   `json:"vfs_path"`
+	ID             string   `json:"id"`
+	EvidenceType   string   `json:"evidence_type"`
+	EvidenceSource string   `json:"evidence_source"`
+	DocumentID     string   `json:"document_id"`
+	DocumentName   string   `json:"document_name"`
+	DatasetID      string   `json:"dataset_id"`
+	ProjectID      string   `json:"project_id"`
+	AssetID        string   `json:"asset_id,omitempty"`
+	PreviewURL     string   `json:"preview_url,omitempty"`
+	Content        string   `json:"content"`
+	Snippet        string   `json:"snippet"`
+	Score          float64  `json:"score"`
+	HeaderPath     []string `json:"header_path"`
+	VfsPath        string   `json:"vfs_path"`
+	StructurePath  string   `json:"structure_path"`
+}
+
+type RetrieveEvidence struct {
+	ID            string                  `json:"id"`
+	Type          string                  `json:"type"`
+	Source        string                  `json:"source"`
+	Score         float64                 `json:"score,omitempty"`
+	DocumentID    string                  `json:"document_id,omitempty"`
+	DocumentName  string                  `json:"document_name,omitempty"`
+	DatasetID     string                  `json:"dataset_id,omitempty"`
+	ProjectID     string                  `json:"project_id,omitempty"`
+	ProjectNodeID string                  `json:"project_node_id,omitempty"`
+	VfsPath       string                  `json:"vfs_path,omitempty"`
+	StructurePath string                  `json:"structure_path,omitempty"`
+	Text          *RetrieveTextEvidence   `json:"text,omitempty"`
+	Visual        *RetrieveVisualEvidence `json:"visual,omitempty"`
+}
+
+type RetrieveTextEvidence struct {
+	SegmentID string `json:"segment_id,omitempty"`
+	Content   string `json:"content,omitempty"`
+	Snippet   string `json:"snippet,omitempty"`
+}
+
+type RetrieveVisualEvidence struct {
+	AssetID        string `json:"asset_id,omitempty"`
+	PreviewURL     string `json:"preview_url,omitempty"`
+	MimeType       string `json:"mime_type,omitempty"`
+	PositionType   string `json:"position_type,omitempty"`
+	PositionLabel  string `json:"position_label,omitempty"`
+	Page           *int   `json:"page,omitempty"`
+	ParagraphIndex *int   `json:"paragraph_index,omitempty"`
+	Description    string `json:"description,omitempty"`
+	EvidenceReason string `json:"evidence_reason,omitempty"`
+}
+
+type RetrieveMeta struct {
+	Strategy      string   `json:"strategy"`
+	TopK          int      `json:"top_k"`
+	CandidateTopK int      `json:"candidate_top_k"`
+	Keywords      []string `json:"keywords,omitempty"`
+	FallbackUsed  bool     `json:"fallback_used,omitempty"`
 }
 
 type RetrieveResponse struct {
-	List []RetrieveResult `json:"list"`
+	Results   []RetrieveResult   `json:"-"`
+	Evidence  []RetrieveEvidence `json:"evidence,omitempty"`
+	Retrieval *RetrieveMeta      `json:"retrieval,omitempty"`
 }
 
 func (c *Client) Retrieve(ctx context.Context, req *RetrieveRequest) (*RetrieveResponse, error) {
@@ -60,7 +111,55 @@ func (c *Client) Retrieve(ctx context.Context, req *RetrieveRequest) (*RetrieveR
 	if err := c.doPost(ctx, "/api/rag/retrieve", req, &wrapper); err != nil {
 		return nil, fmt.Errorf("kh retrieve: %w", err)
 	}
+	wrapper.Data.normalizeResultsFromEvidence()
 	return &wrapper.Data, nil
+}
+
+func (r *RetrieveResponse) normalizeResultsFromEvidence() {
+	if len(r.Evidence) == 0 {
+		return
+	}
+
+	r.Results = make([]RetrieveResult, 0, len(r.Evidence))
+	for _, ev := range r.Evidence {
+		item := RetrieveResult{
+			ID:             ev.ID,
+			EvidenceType:   ev.Type,
+			EvidenceSource: ev.Source,
+			DocumentID:     ev.DocumentID,
+			DocumentName:   ev.DocumentName,
+			DatasetID:      ev.DatasetID,
+			ProjectID:      ev.ProjectID,
+			Score:          ev.Score,
+			VfsPath:        ev.VfsPath,
+			StructurePath:  ev.StructurePath,
+		}
+		if ev.Text != nil {
+			if ev.Text.SegmentID != "" {
+				item.ID = ev.Text.SegmentID
+			}
+			item.Content = ev.Text.Content
+			item.Snippet = ev.Text.Snippet
+		} else if ev.Visual != nil {
+			item.AssetID = ev.Visual.AssetID
+			item.PreviewURL = ev.Visual.PreviewURL
+			item.Content = firstNonEmptyString(ev.Visual.EvidenceReason, ev.Visual.Description)
+			item.Snippet = item.Content
+		}
+		if item.Content == "" {
+			item.Content = item.Snippet
+		}
+		r.Results = append(r.Results, item)
+	}
+}
+
+func firstNonEmptyString(values ...string) string {
+	for _, value := range values {
+		if value != "" {
+			return value
+		}
+	}
+	return ""
 }
 
 // ---- 文档精读 ----

@@ -7,10 +7,15 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/google/uuid"
 )
+
+const downloadChatFileTimeout = 20 * time.Second
 
 // Client 封装企微平台 API 调用
 type Client struct {
@@ -19,17 +24,20 @@ type Client struct {
 	appSecret  string
 	httpClient *http.Client
 
-	mu         sync.RWMutex
-	token      string
-	tokenExpAt time.Time
+	mu              sync.RWMutex
+	token           string
+	tokenExpAt      time.Time
+	downloadMu      sync.Mutex
+	downloadWaiters map[string]chan DownloadChatFileResult
 }
 
 func NewClient(host, appKey, appSecret string) *Client {
 	return &Client{
-		host:       strings.TrimRight(host, "/"),
-		appKey:     appKey,
-		appSecret:  appSecret,
-		httpClient: &http.Client{Timeout: 10 * time.Second},
+		host:            strings.TrimRight(host, "/"),
+		appKey:          appKey,
+		appSecret:       appSecret,
+		httpClient:      &http.Client{Timeout: 10 * time.Second},
+		downloadWaiters: make(map[string]chan DownloadChatFileResult),
 	}
 }
 
@@ -171,6 +179,126 @@ func (c *Client) GetGroupMemberList(ctx context.Context, robotID, groupID, uniqS
 		return fmt.Errorf("GetGroupMemberList error: %d %s", out.ErrCode, out.ErrMsg)
 	}
 	return nil
+}
+
+// DownloadChatFileResult 是 DownloadChatFile 异步回调返回的文件下载信息。
+type DownloadChatFileResult struct {
+	FileURL  string
+	FileName string
+	ErrCode  int
+	ErrMsg   string
+}
+
+// ResolveChatFileURL 把消息里的媒体引用解析成可下载 URL。
+// 平台文档把 receive.group.msg 的 image.url 描述为资源 url，但实际可能是 file_md5。
+func (c *Client) ResolveChatFileURL(ctx context.Context, robotID, mediaRef string) (DownloadChatFileResult, error) {
+	mediaRef = strings.TrimSpace(mediaRef)
+	if mediaRef == "" {
+		return DownloadChatFileResult{}, fmt.Errorf("media ref is empty")
+	}
+	if isHTTPURL(mediaRef) {
+		return DownloadChatFileResult{FileURL: mediaRef}, nil
+	}
+	return c.DownloadChatFileURL(ctx, robotID, mediaRef)
+}
+
+// DownloadChatFileURL 触发 DownloadChatFile，并等待 download.chat.file 异步回调。
+func (c *Client) DownloadChatFileURL(ctx context.Context, robotID, fileMD5 string) (DownloadChatFileResult, error) {
+	robotID = strings.TrimSpace(robotID)
+	fileMD5 = strings.TrimSpace(fileMD5)
+	if robotID == "" {
+		return DownloadChatFileResult{}, fmt.Errorf("robot id is empty")
+	}
+	if fileMD5 == "" {
+		return DownloadChatFileResult{}, fmt.Errorf("file md5 is empty")
+	}
+
+	waitCtx, cancel := context.WithTimeout(ctx, downloadChatFileTimeout)
+	defer cancel()
+
+	uniqSN := uuid.NewString()
+	ch := c.registerDownloadWaiter(uniqSN)
+	defer c.unregisterDownloadWaiter(uniqSN)
+
+	tk, err := c.GetToken(waitCtx)
+	if err != nil {
+		return DownloadChatFileResult{}, fmt.Errorf("get token: %w", err)
+	}
+
+	body, _ := json.Marshal(map[string]string{
+		"robot_id": robotID,
+		"file_md5": fileMD5,
+		"uniq_sn":  uniqSN,
+	})
+	resp, err := c.doPost(waitCtx, "/gateway/jzopen/DownloadChatFile", tk, body)
+	if err != nil {
+		return DownloadChatFileResult{}, fmt.Errorf("request DownloadChatFile: %w", err)
+	}
+	defer resp.Body.Close()
+
+	var out struct {
+		ErrCode int    `json:"errcode"`
+		ErrMsg  string `json:"errmsg"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return DownloadChatFileResult{}, fmt.Errorf("decode DownloadChatFile response: %w", err)
+	}
+	if out.ErrCode != 0 {
+		return DownloadChatFileResult{}, fmt.Errorf("DownloadChatFile error: %d %s", out.ErrCode, out.ErrMsg)
+	}
+
+	select {
+	case result := <-ch:
+		if result.ErrCode != 0 {
+			return DownloadChatFileResult{}, fmt.Errorf("DownloadChatFile callback error: %d %s", result.ErrCode, result.ErrMsg)
+		}
+		if strings.TrimSpace(result.FileURL) == "" {
+			return DownloadChatFileResult{}, fmt.Errorf("DownloadChatFile callback missing file_url")
+		}
+		return result, nil
+	case <-waitCtx.Done():
+		return DownloadChatFileResult{}, fmt.Errorf("wait DownloadChatFile callback: %w", waitCtx.Err())
+	}
+}
+
+// CompleteDownloadChatFile 由 dispatcher 在收到 download.chat.file 回调时调用。
+func (c *Client) CompleteDownloadChatFile(uniqSN string, result DownloadChatFileResult) bool {
+	uniqSN = strings.TrimSpace(uniqSN)
+	if uniqSN == "" {
+		return false
+	}
+	c.downloadMu.Lock()
+	defer c.downloadMu.Unlock()
+	ch, ok := c.downloadWaiters[uniqSN]
+	if !ok {
+		return false
+	}
+	delete(c.downloadWaiters, uniqSN)
+	ch <- result
+	close(ch)
+	return true
+}
+
+func (c *Client) registerDownloadWaiter(uniqSN string) chan DownloadChatFileResult {
+	ch := make(chan DownloadChatFileResult, 1)
+	c.downloadMu.Lock()
+	c.downloadWaiters[uniqSN] = ch
+	c.downloadMu.Unlock()
+	return ch
+}
+
+func (c *Client) unregisterDownloadWaiter(uniqSN string) {
+	c.downloadMu.Lock()
+	delete(c.downloadWaiters, uniqSN)
+	c.downloadMu.Unlock()
+}
+
+func isHTTPURL(value string) bool {
+	parsed, err := url.Parse(strings.TrimSpace(value))
+	if err != nil {
+		return false
+	}
+	return parsed.Scheme == "http" || parsed.Scheme == "https"
 }
 
 // RobotSnapshot 同步接口返回的机器人信息

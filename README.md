@@ -9,9 +9,9 @@
 ```text
 企微回调
   -> callback / dispatcher / message
+     -> 图片消息: DownloadChatFile -> imagectx.Observer -> [图片观察]
   -> agent.Service
-     -> preSearch / query rewrite / prompt 组装
-     -> turnmesh.RunOneShot(...)    // query rewrite
+     -> prompt 组装
      -> turnmesh.New(...).RunTurn() // 主问答链路
      -> tools: search_knowledge / read_document / check_feature_tag / ask_clarification
   -> wecom send message
@@ -44,8 +44,11 @@ go run ./cmd/server/
 
 其中：
 
-- 应用策略配置：`history_limit`、`reply_max_length`、`pre_search_*`
+- 应用策略配置：`history_limit`、`reply_max_length`、`retrieval_*`、`read_document_max_chars`
+- 图片理解配置：`image_understanding_mode`、`vision_*`
 - runtime 相关配置：`token_budget`、`tool_timeout_seconds`
+
+`reply_max_length: 0` 表示不做最终回复硬截断；`search_knowledge` 通过 `retrieval_context_budget` 控制整体证据输出量，而不是先把每条证据固定砍短。
 
 ## 仓库边界
 
@@ -54,26 +57,31 @@ go run ./cmd/server/
 - 企微消息路由与触发规则
 - 群组 / 客户 / 会话上下文
 - knowledge-hub 检索和文档精读策略
-- prompt、query rewrite、fallback 规则
+- 图片消息解析、图片观察 prompt、群聊图文合并策略
+- prompt、fallback 规则
 - 客服工具实现
 
 下沉到 `turnmesh`：
 
 - provider session
-- 单次 one-shot 调用
+- 图片观察等单次 one-shot 调用
 - 多轮 turn loop
 - tool call dispatch
 - tool result continuation
+- provider-neutral 多模态消息表达
 
 ## 关键入口
 
 - [cmd/server/main.go](/Users/jayleonc/Developer/work/git.pinquest.cn/ai-customer/cmd/server/main.go:1)
 - [internal/message/handler.go](/Users/jayleonc/Developer/work/git.pinquest.cn/ai-customer/internal/message/handler.go:1)
+- [internal/imagectx/observer.go](/Users/jayleonc/Developer/work/git.pinquest.cn/ai-customer/internal/imagectx/observer.go:1)
 - [internal/agent/service.go](/Users/jayleonc/Developer/work/git.pinquest.cn/ai-customer/internal/agent/service.go:1)
-- [internal/agent/rewrite.go](/Users/jayleonc/Developer/work/git.pinquest.cn/ai-customer/internal/agent/rewrite.go:1)
+- [internal/agent/tools.go](/Users/jayleonc/Developer/work/git.pinquest.cn/ai-customer/internal/agent/tools.go:1)
+- [internal/wecom/client.go](/Users/jayleonc/Developer/work/git.pinquest.cn/ai-customer/internal/wecom/client.go:1)
 
 ## 相关文档
 
+- [docs/image-understanding.md](/Users/jayleonc/Developer/work/git.pinquest.cn/ai-customer/docs/image-understanding.md:1)
 - [CLAUDE.md](/Users/jayleonc/Developer/work/git.pinquest.cn/ai-customer/CLAUDE.md:1)
 - [DEV_LOG.md](/Users/jayleonc/Developer/work/git.pinquest.cn/ai-customer/DEV_LOG.md:1)
 - [spec.md](/Users/jayleonc/Developer/work/git.pinquest.cn/ai-customer/spec.md:1)
